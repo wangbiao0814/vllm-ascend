@@ -26,6 +26,7 @@ from vllm_ascend.ascend_config import (
     AscendConfig,
     SchedulerConfig,
     ShortRequestFirstConfig,
+    SparseKVOffloadConfig,
     clear_ascend_config,
     get_ascend_config,
     init_ascend_config,
@@ -731,3 +732,43 @@ class TestSchedulerConfig(TestBase):
 
         self.assertTrue(config.enable_balance_scheduling)
         mock_info_once.assert_called_once()
+
+
+class TestSparseKVOffloadEvictionConfig(TestBase):
+    @staticmethod
+    def make_config(**overrides):
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(hf_text_config=SimpleNamespace(index_topk=2)),
+            parallel_config=SimpleNamespace(
+                prefill_context_parallel_size=1, decode_context_parallel_size=1, pipeline_parallel_size=1,
+            ),
+            kv_transfer_config=SimpleNamespace(is_kv_consumer=True),
+            use_v2_model_runner=False,
+        )
+        return SparseKVOffloadConfig(vllm_config, {"enabled": True, **overrides})
+
+    def test_default_policy_preserves_lru(self):
+        config = self.make_config()
+        self.assertEqual(config.eviction_policy, "lru")
+        self.assertEqual(config.probation_age, 4)
+
+    def test_select_reuse_prioritized_policy(self):
+        for age in (0, 4, SparseKVOffloadConfig.MAX_RESIDENT_AGE):
+            with self.subTest(age=age):
+                config = self.make_config(eviction_policy="reuse_prioritized_lru", probation_age=age)
+                self.assertEqual(config.eviction_policy, "reuse_prioritized_lru")
+                self.assertEqual(config.probation_age, age)
+
+    def test_reject_unknown_policy(self):
+        for policy in ("fifo", "REUSE_PRIORITIZED_LRU", None, 1):
+            with self.subTest(policy=policy), self.assertRaisesRegex(ValueError, "eviction_policy"):
+                self.make_config(eviction_policy=policy)
+
+    def test_reject_invalid_probation_age(self):
+        for age in (-1, 1 << 31, 1.5, "4", True, None):
+            with self.subTest(age=age), self.assertRaisesRegex(ValueError, "probation_age"):
+                self.make_config(eviction_policy="reuse_prioritized_lru", probation_age=age)
+
+    def test_disabled_offload_keeps_configuration_optional(self):
+        config = SparseKVOffloadConfig(None, {"enabled": False})
+        self.assertFalse(config.enabled)

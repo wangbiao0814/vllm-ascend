@@ -168,11 +168,50 @@ Add the following options to the Decode launch command:
 | `dram_size_per_dp_GB` | Host memory reserved per DP rank. It must hold the full KV cache. TP ranks share this pool. |
 | `keep_device_kv_cache` | Debug-only option that retains the full device KV cache. Keep it `false` in production. |
 | `lru_max_threads` | Per-Decode-Worker CPU LRU planner thread budget. Positive integer; default `8`. |
+| `eviction_policy` | CPU eviction policy: `lru` (default) or `reuse_prioritized_lru`. |
+| `probation_age` | Initial age of a cache miss under `reuse_prioritized_lru`. Integer in `[0, 2147483646]`, default `4`. A resident hit resets its age to zero. |
 
 `lru_max_threads` caps the CPU LRU planner per Decode Worker. The effective
 team is also limited by the current work rows and the process CPU affinity.
 A larger value allocates more per-thread CPU workspaces; give the Worker an
 adequate NUMA-local CPU affinity range before increasing it.
+
+### Reuse-prioritized LRU
+
+To test reuse-prioritized eviction, add the following fields inside
+`sparse_kv_offload_config`:
+
+```json
+{
+    "eviction_policy": "reuse_prioritized_lru",
+    "probation_age": 4
+}
+```
+
+The CPU C++ planner protects all current hits, resets their ages to zero, and
+assigns newly loaded entries the configured probation age. It uses free slots
+first, then evicts the oldest non-hit entries. Resident ages increase with each
+planner update and saturate instead of wrapping. Logical slot/age pairs are
+merged in linear time; physical KV is not moved to reorder the cache.
+
+`lru` keeps the existing behavior and does not allocate age buffers. Both
+policies use the same miss-only H2D and resident attention path. Graph execution
+continues to call the CPU planner through a host callback. Layers with
+`skip_topk` reuse the source layer's slots and misses without a second age update.
+A probation age of zero is valid but does not guarantee equivalence to `lru`.
+
+Run the production CPU planner tests without an NPU:
+
+```bash
+python tests/ut/distributed/kv_transfer/sparse_kv_offload/test_lru_resident.py -v
+```
+
+This requires a C++17 compiler. Tests compare both policies on scan workloads,
+including `capacity=4096, topk=2048`, and compare the new policy against a sorting
+reference. When OpenMP is available, the same tests also exercise row-level
+parallelism. The tests also print a warmed-up CPU planner timing comparison (including ctypes
+call overhead), without asserting a timing threshold. Validate NPU latency,
+throughput, graph replay and KV correctness separately on Ascend hardware.
 
 ## 4. Use Them Together
 

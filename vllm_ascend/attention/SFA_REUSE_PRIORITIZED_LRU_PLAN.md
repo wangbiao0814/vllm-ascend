@@ -2,7 +2,7 @@
 
 整理日期：2026-10-26。源码基线：当前工作区 `64ba45045`。
 
-本文交付可实施的改造设计与算法参考代码，不代表生产代码已经修改、编译或通过 NPU 验证。
+本文保留原始改造设计与算法参考代码。2026-10-27 已接入 CPU C++ 策略及配置开关，实际实现与验证范围见第 13 节；尚未通过 NPU 验证。
 
 ## 1. 可行性结论
 
@@ -87,7 +87,7 @@ attention/sfa_kv_offload.py
 
 ## 4. 拟修改文件与职责
 
-以下均为计划修改；本次只新增本文档。
+下表保留原始计划修改清单；当前实现与验证进度见第 13 节。
 
 | 文件或位置 | 拟修改内容 | 范围 |
 | --- | --- | --- |
@@ -200,7 +200,6 @@ slot_to_token[row, s] = 物理槽 s 当前 token
 
 ```python
 MAX_RESIDENT_AGE = (1 << 31) - 2
-
 
 def reuse_prioritized_step(
     slot_to_token, lru_slots, lru_stamps, topk,
@@ -412,7 +411,7 @@ MTP 后缀先失效再判断 Hit。这一点优先于任何 age 保护规则，�
 3. 完成 C++ 差分、图回放、MTP、TP 和 skip_topk 生命周期验证。
 4. 在 Ascend NPU 上完成精度和参数扫描，依据端到端结果决定 P。
 
-本次只新增本 Markdown 方案，未修改生产 Python/C++、未新增配置项、未运行 NPU 测试。第 7 节参考算法可用于下一步实现，但不是已注册的运行时接口。
+原方案阶段仅交付 Markdown 设计。当前已完成的生产代码、配置项和测试见第 13 节；第 7 节仍为 Python 算法参考，不是运行时接口。
 
 ### 12.1 本次文档内算法核对记录
 
@@ -422,3 +421,21 @@ MTP 后缀先失效再判断 Hit。这一点优先于任何 age 保护规则，�
 - 固定随机种子 42，100 组、每组 100 轮，共 10,000 次状态转移，检查 slot 排列、有效区 age 降序、token 唯一性和本轮 token/slot 对应关系，均通过。
 - 这些检查只覆盖参考算法，不代表 C++ 差分测试或 NPU 集成验证完成。
 - 尝试运行 `bash format.sh ci`，因本机未安装 `pre-commit` 在依赖检查阶段退出，完整仓库格式检查未执行。
+
+## 13. CPU C++ 实现记录（2026-10-27）
+
+已增加 `sparse_kv_offload_config.eviction_policy`，取值为 `lru`（默认）或 `reuse_prioritized_lru`，以及整数 `probation_age`（默认 4）。Python manager 仅为新策略分配 age 状态和线程工作区，并在现有 callback 中选择 C++ 入口。
+
+生产 CPU 决策整理到 `distributed/kv_transfer/sparse_kv_offload/lru_resident.h`，由原 `sparse_kv_offload.cpp` 包含并注册 Python 入口。原有 LRU 算法与入口保留。这样测试能直接编译并调用生产算法，无需 torch/ACL/NPU。新策略每行使用既有 3C 个 slot scratch 和新增 C 个 age scratch，不进行动态分配或全量排序。
+
+与第 6.4 节的原始提案不同，实现支持重复 top-k：同轮同一 token 仅分配和回载一次，各原始 attention 位置返回同一物理 slot。同轮重复不会将首次 Miss 提升为 Hit；第 7 节参考代码仍以唯一有效 token 为前提，实际测试另用支持重复索引的排序 oracle。
+
+`skip_topk` 是 attention 实例初始化时固定的选项，复用层继续使用源层的描述符和布局，不另行调用策略或更新 age。现有 CPU host callback、H2D 地址计算、resident attention 和 TP 同步路径保持不变。
+
+已新增测试：
+
+- `test_lru_resident.py`：直接编译生产 C++，与排序 oracle 随机对照，并检查旧 LRU 与新策略的抗扫描差异。
+- `TestSparseKVOffloadEvictionConfig`：默认值、策略选择、P 边界及非法配置。
+- `TestResidentPlannerDispatch`：两种策略的 callback 分发、层 age 指针及地址计算输入。
+
+本机生产 C++ 测试通过，构造的 C=4096、K=2048 扫描序列累计 Miss 从 10240 降到 8192。本机没有 OpenMP 开发库，运行的是串行 fallback；多线程执行仍需在带 OpenMP 的环境验证。本机没有 vLLM，配置和 callback 测试通过抽取真实定义隔离执行，完整 UT 仍需在开发环境运行。NPU 精度、图回放、TP、PD 及端到端吞吐尚未验证。
