@@ -168,6 +168,8 @@ Add the following options to the Decode launch command:
 | `dram_size_per_dp_GB` | Host memory reserved per DP rank. It must hold the full KV cache. TP ranks share this pool. |
 | `keep_device_kv_cache` | Debug-only option that retains the full device KV cache. Keep it `false` in production. |
 | `lru_max_threads` | Per-Decode-Worker CPU LRU planner thread budget. Positive integer; default `8`. |
+| `hit_rate_log_interval` | CPU C++ statistics: `0` disables collection (default). A positive integer logs cumulative per-layer and access-weighted overall hit rates every N measured updates per layer, on TP rank 0 only. |
+| `hit_rate_warmup_steps` | Non-negative number of initial updates to exclude per layer, default `0`. Graph capture/warmup is not automatically excluded. |
 | `eviction_policy` | CPU eviction policy: `lru` (default) or `reuse_prioritized_lru`. |
 | `probation_age` | Initial age of a cache miss under `reuse_prioritized_lru`. Integer in `[0, 2147483646]`, default `4`. A resident hit resets its age to zero. |
 

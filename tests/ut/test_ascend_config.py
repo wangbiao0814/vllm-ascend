@@ -747,6 +747,17 @@ class TestSparseKVOffloadEvictionConfig(TestBase):
         )
         return SparseKVOffloadConfig(vllm_config, {"enabled": True, **overrides})
 
+    def test_hit_rate_stats_configuration(self):
+        self.assertEqual(self.make_config().hit_rate_log_interval, 0)
+        self.assertEqual(self.make_config().hit_rate_warmup_steps, 0)
+        config = self.make_config(hit_rate_log_interval=100, hit_rate_warmup_steps=10)
+        self.assertEqual(config.hit_rate_log_interval, 100)
+        self.assertEqual(config.hit_rate_warmup_steps, 10)
+        for name in ("hit_rate_log_interval", "hit_rate_warmup_steps"):
+            for value in (-1, True, 1.5, "10", None):
+                with self.subTest(name=name, value=value), self.assertRaisesRegex(ValueError, name):
+                    self.make_config(**{name: value})
+
     def test_default_policy_preserves_lru(self):
         config = self.make_config()
         self.assertEqual(config.eviction_policy, "lru")

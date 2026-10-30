@@ -187,6 +187,7 @@ class TestHostDeviceMemoryRatio(unittest.TestCase):
 class TestResidentPlannerDispatch(unittest.TestCase):
     def test_skip_topk_reuses_source_layout_without_second_age_update(self):
         manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
+        manager.hit_rate_stats = MagicMock()
         manager._get_offload_layer_id = MagicMock(return_value=1)
         manager._onload_topk_kv_cpu = MagicMock()
         manager.max_num_topk_rows = 2
@@ -207,15 +208,17 @@ class TestResidentPlannerDispatch(unittest.TestCase):
                 "layer.1", 2, 2, MagicMock(), MagicMock(), current_slots, MagicMock(), MagicMock(), skip_topk=True,
             )
         manager._onload_topk_kv_cpu.assert_not_called()
+        manager.hit_rate_stats.record_reused.assert_called_once_with(1, 0)
         offload.sparse_copy.assert_called_once()
         current_slots.__getitem__.return_value.copy_.assert_called_once_with(
             manager.lru_current_slots_cpu.__getitem__.return_value, non_blocking=False,
         )
 
     def test_callback_selects_planner_and_preserves_address_inputs(self):
-        for policy in ("lru", "reuse_prioritized_lru"):
-            with self.subTest(policy=policy):
+        for policy, stats_enabled in (("lru", False), ("lru", True), ("reuse_prioritized_lru", True)):
+            with self.subTest(policy=policy, stats_enabled=stats_enabled):
                 manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
+                manager.hit_rate_stats = MagicMock() if stats_enabled else None
                 manager.eviction_policy = policy
                 manager.probation_age = 4
                 manager.topk = 2
@@ -229,6 +232,8 @@ class TestResidentPlannerDispatch(unittest.TestCase):
                 # block table, address metadata, scratch, outputs, layer id.
                 args = (2, "counts", "tokens", "slots", *range(10, 20), "blocks", *range(21, 37), 1)
                 manager._onload_topk_kv_cpu(args)
+                if stats_enabled:
+                    manager.hit_rate_stats.record.assert_called_once_with(1, 12, 16, 17, 18, 10, 2, 2)
                 common = (*range(10, 20), *range(28, 33), 2, 2, 4, 128, 1, 1)
                 if policy == "lru":
                     manager.sparse_kv_offload_cpp.lru_resident_compact.assert_called_once_with(*common)

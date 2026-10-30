@@ -445,6 +445,16 @@ class SparseKVOffloadManager:
             raise ValueError("Sparse KV offload did not find SFA KV cache layers.")
 
         self.num_layers = len(self.offload_layer_names)
+        self.hit_rate_stats = None
+        if self.tp_rank == 0 and self.sparse_kv_offload_config.hit_rate_log_interval > 0:
+            self.hit_rate_stats = self.sparse_kv_offload_cpp.SparseKVHitRateStats(
+                self.offload_layer_names,
+                self.eviction_policy,
+                f"pid={os.getpid()} tp_rank=0",
+                self.max_model_len,
+                self.sparse_kv_offload_config.hit_rate_log_interval,
+                self.sparse_kv_offload_config.hit_rate_warmup_steps,
+            )
         self.layer_name_to_offload_id = {
             layer_name: layer_id for layer_id, layer_name in enumerate(self.offload_layer_names)
         }
@@ -949,6 +959,16 @@ class SparseKVOffloadManager:
             )
             self.gvas_buffer_npu += gvas_offset
             self.addr_buffer_npu += addr_offset
+            if self.hit_rate_stats is not None:
+                if capturing:
+                    stream = torch_npu.npu.current_stream()
+                    subscribed_streams = get_subscribed_compute_streams()
+                    if stream not in subscribed_streams:
+                        torch_npu.npu._subscribe_report(stream)
+                        subscribed_streams.add(stream)
+                    torch_npu.npu._launch_host_func(stream, self._record_reused_hit_rate, (layer_id,))
+                else:
+                    self._record_reused_hit_rate((layer_id,))
         else:
             if token_to_req_npu is not None:
                 block_table_cpu = self.block_table_expanded_cpu[:num_tokens]
@@ -1023,6 +1043,10 @@ class SparseKVOffloadManager:
         current_slots_cpu = self.lru_current_slots_cpu[:num_tokens]
         current_slots_npu[:num_tokens].copy_(current_slots_cpu, non_blocking=capturing)
 
+    def _record_reused_hit_rate(self, args):
+        layer_id = args[0]
+        self.hit_rate_stats.record_reused(layer_id, layer_id - 1)
+
     def _onload_topk_kv_cpu(self, args):
         # code that is incompatible with graph mode, compute here outside graph
         (
@@ -1091,6 +1115,11 @@ class SparseKVOffloadManager:
             )
         else:
             self.sparse_kv_offload_cpp.lru_resident_compact(*planner_args)
+        if self.hit_rate_stats is not None:
+            self.hit_rate_stats.record(
+                layer_id, lru_topk_indices_ptr, lru_current_slots_ptr, lru_miss_count_ptr,
+                lru_miss_tokens_ptr, lru_req_ids_ptr, num_reqs, self.topk,
+            )
         self.sparse_kv_offload_cpp.compute_lru_resident_addrs(
             miss_count,
             miss_tokens,

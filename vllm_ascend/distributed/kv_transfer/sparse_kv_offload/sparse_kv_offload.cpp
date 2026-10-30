@@ -20,6 +20,8 @@
 #include <pthread.h>
 
 #include "lru_resident.h"
+#include "hit_rate_stats.h"
+#include <pybind11/stl.h>
 
 int32_t compute_lru_resident_addrs(const at::Tensor& miss_count, const at::Tensor& miss_tokens,
                                    const at::Tensor& miss_slots, const at::Tensor& block_table,
@@ -116,6 +118,12 @@ int32_t compute_lru_resident_addrs(const at::Tensor& miss_count, const at::Tenso
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   namespace py = pybind11;
+  py::class_<SparseKVHitRateStats>(m, "SparseKVHitRateStats")
+      .def(py::init<std::vector<std::string>, std::string, std::string, int64_t, int64_t, int64_t>())
+      .def("record", &SparseKVHitRateStats::record)
+      .def("record_reused", &SparseKVHitRateStats::record_reused)
+      .def("snapshot", &SparseKVHitRateStats::snapshot)
+      .def("reset", &SparseKVHitRateStats::reset);
   m.def("lru_resident_compact", &lru_resident_compact,
         "CPU LRU resident compact miss prepare with OpenMP row-level parallelism");
   m.def("reuse_prioritized_lru_resident_compact", &reuse_prioritized_lru_resident_compact,

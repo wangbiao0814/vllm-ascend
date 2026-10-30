@@ -1056,6 +1056,14 @@ class SparseKVOffloadConfig:
         self.keep_device_kv_cache = bool(user_config.get("keep_device_kv_cache", False))
         self.lru_max_threads = int(user_config.get("lru_max_threads", 8))
 
+        # Zero disables collection, allocation and logging in the decode hot path.
+        self.hit_rate_log_interval = user_config.get("hit_rate_log_interval", 0)
+        self.hit_rate_warmup_steps = user_config.get("hit_rate_warmup_steps", 0)
+        for name in ("hit_rate_log_interval", "hit_rate_warmup_steps"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"sparse_kv_offload_config.{name} must be a non-negative integer")
+
         self.eviction_policy = user_config.get("eviction_policy", "lru")
         if self.eviction_policy not in ("lru", "reuse_prioritized_lru"):
             raise ValueError("sparse_kv_offload_config.eviction_policy must be lru or reuse_prioritized_lru")
