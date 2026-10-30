@@ -119,9 +119,10 @@ int32_t compute_lru_resident_addrs(const at::Tensor& miss_count, const at::Tenso
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   namespace py = pybind11;
   py::class_<SparseKVHitRateStats>(m, "SparseKVHitRateStats")
-      .def(py::init<std::vector<std::string>, std::string, std::string, int64_t, int64_t, int64_t>())
+      .def(py::init<std::vector<std::string>, std::string, std::string, int64_t, int64_t, int64_t, bool>())
       .def("record", &SparseKVHitRateStats::record)
       .def("record_reused", &SparseKVHitRateStats::record_reused)
+      .def("finish_request", &SparseKVHitRateStats::finish_request)
       .def("snapshot", &SparseKVHitRateStats::snapshot)
       .def("reset", &SparseKVHitRateStats::reset);
   m.def("lru_resident_compact", &lru_resident_compact,

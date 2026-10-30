@@ -446,7 +446,10 @@ class SparseKVOffloadManager:
 
         self.num_layers = len(self.offload_layer_names)
         self.hit_rate_stats = None
-        if self.tp_rank == 0 and self.sparse_kv_offload_config.hit_rate_log_interval > 0:
+        if self.tp_rank == 0 and (
+            self.sparse_kv_offload_config.hit_rate_log_interval > 0
+            or self.sparse_kv_offload_config.hit_rate_log_on_request_end
+        ):
             self.hit_rate_stats = self.sparse_kv_offload_cpp.SparseKVHitRateStats(
                 self.offload_layer_names,
                 self.eviction_policy,
@@ -454,6 +457,7 @@ class SparseKVOffloadManager:
                 self.max_model_len,
                 self.sparse_kv_offload_config.hit_rate_log_interval,
                 self.sparse_kv_offload_config.hit_rate_warmup_steps,
+                self.sparse_kv_offload_config.hit_rate_log_on_request_end,
             )
         self.layer_name_to_offload_id = {
             layer_name: layer_id for layer_id, layer_name in enumerate(self.offload_layer_names)
@@ -1043,6 +1047,21 @@ class SparseKVOffloadManager:
         current_slots_cpu = self.lru_current_slots_cpu[:num_tokens]
         current_slots_npu[:num_tokens].copy_(current_slots_cpu, non_blocking=capturing)
 
+    def finish_hit_rate_requests(self, req_ids):
+        if not req_ids or self.hit_rate_stats is None or not self.sparse_kv_offload_config.hit_rate_log_on_request_end:
+            return
+        # No synchronization: queue behind all prior graph/eager decode work.
+        stream = torch_npu.npu.current_stream()
+        subscribed = get_subscribed_compute_streams()
+        if stream not in subscribed:
+            torch_npu.npu._subscribe_report(stream)
+            subscribed.add(stream)
+        torch_npu.npu._launch_host_func(stream, self._finish_hit_rate_requests_cpu, tuple(req_ids))
+
+    def _finish_hit_rate_requests_cpu(self, req_ids):
+        for req_id in req_ids:
+            self.hit_rate_stats.finish_request(adler32(req_id.encode("utf-8")), req_id)
+
     def _record_reused_hit_rate(self, args):
         layer_id = args[0]
         self.hit_rate_stats.record_reused(layer_id, layer_id - 1)
@@ -1162,3 +1181,8 @@ def init_sparse_kv_offload_manager(
 def get_sparse_kv_offload_manager():
     assert _SPARSE_KV_OFFLOAD_MANAGER is not None, "KV offload manager is not initialized."
     return _SPARSE_KV_OFFLOAD_MANAGER
+
+
+def finish_sparse_kv_hit_rate_requests(req_ids):
+    if _SPARSE_KV_OFFLOAD_MANAGER is not None:
+        _SPARSE_KV_OFFLOAD_MANAGER.finish_hit_rate_requests(req_ids)

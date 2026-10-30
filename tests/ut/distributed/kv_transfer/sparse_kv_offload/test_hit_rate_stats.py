@@ -59,6 +59,19 @@ int main() {
   record();  // reset also restarts warmup
   assert(stats.snapshot()[0][2] == 0);
 
+  SparseKVHitRateStats requests({"l0", "l1"}, "lru", "test", 32, 0, 0, true);
+  int32_t selections[] = {1,2,3,4}, positions[] = {0,1,0,1};
+  int32_t counts[] = {1,0}, missing[] = {2,-1,-1,-1};
+  int64_t ids[] = {11,22};
+  requests.record(0, reinterpret_cast<uintptr_t>(selections), reinterpret_cast<uintptr_t>(positions),
+                  reinterpret_cast<uintptr_t>(counts), reinterpret_cast<uintptr_t>(missing),
+                  reinterpret_cast<uintptr_t>(ids), 2, 2);
+  requests.record_reused(1, 0);
+  requests.finish_request(11, "request-A");
+  requests.finish_request(11, "request-A");  // duplicate completion must not print twice
+  requests.finish_request(22, "request-B");
+  requests.finish_request(99, "prefill-only");  // no decode state, no output
+
   SparseKVHitRateStats empty({"empty"}, "lru", "test", 32, 1, 0);
   topk[0] = -1; topk[2] = -1; count[0] = 0;
   empty.record(0, reinterpret_cast<uintptr_t>(topk), reinterpret_cast<uintptr_t>(slots),
@@ -72,6 +85,10 @@ int main() {
                 check=True, capture_output=True, text=True,
             )
             result = subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+        self.assertEqual(result.stdout.count("request_id=request-A layer=ALL"), 1)
+        self.assertIn("request_id=request-A layer=ALL hits=2 misses=2 hit_rate=50%", result.stdout)
+        self.assertIn("request_id=request-B layer=ALL hits=4 misses=0 hit_rate=100%", result.stdout)
+        self.assertNotIn("prefill-only", result.stdout)
         self.assertIn("overall_hits=4 overall_misses=1 overall_hit_rate=80%", result.stdout)
         self.assertIn("layer=layer0 updates=3 hits=2 misses=1", result.stdout)
         self.assertIn("layer=layer1 updates=2 hits=2 misses=0", result.stdout)

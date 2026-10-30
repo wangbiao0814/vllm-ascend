@@ -748,6 +748,11 @@ class TestSparseKVOffloadEvictionConfig(TestBase):
         return SparseKVOffloadConfig(vllm_config, {"enabled": True, **overrides})
 
     def test_hit_rate_stats_configuration(self):
+        self.assertFalse(self.make_config().hit_rate_log_on_request_end)
+        self.assertTrue(self.make_config(hit_rate_log_on_request_end=True).hit_rate_log_on_request_end)
+        for value in (1, "true", None):
+            with self.assertRaisesRegex(ValueError, "hit_rate_log_on_request_end"):
+                self.make_config(hit_rate_log_on_request_end=value)
         self.assertEqual(self.make_config().hit_rate_log_interval, 0)
         self.assertEqual(self.make_config().hit_rate_warmup_steps, 0)
         config = self.make_config(hit_rate_log_interval=100, hit_rate_warmup_steps=10)

@@ -1057,6 +1057,9 @@ class SparseKVOffloadConfig:
         self.lru_max_threads = int(user_config.get("lru_max_threads", 8))
 
         # Zero disables collection, allocation and logging in the decode hot path.
+        self.hit_rate_log_on_request_end = user_config.get("hit_rate_log_on_request_end", False)
+        if type(self.hit_rate_log_on_request_end) is not bool:
+            raise ValueError("sparse_kv_offload_config.hit_rate_log_on_request_end must be a boolean")
         self.hit_rate_log_interval = user_config.get("hit_rate_log_interval", 0)
         self.hit_rate_warmup_steps = user_config.get("hit_rate_warmup_steps", 0)
         for name in ("hit_rate_log_interval", "hit_rate_warmup_steps"):
