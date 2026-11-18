@@ -1788,6 +1788,7 @@ class SparseKVOffloadConfig:
     store_port_base: int = 8500
     topk: int = dataclasses.field(default=0, init=False)
     use_fused_overlap: bool = False
+    collect_hit_rate: bool = False
 
     @property
     def use_fused_copy_sfa(self) -> bool:

@@ -31,6 +31,7 @@ from vllm.v1.utils import CpuGpuBuffer
 
 from vllm_ascend.ascend_config import SparseKVOffloadConfig
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.copy_sfa_topk_slots import copy_sfa_pool_capacity
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.hit_rate import HitRateStats
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.request_identity import RequestIdentityRegistry
 from vllm_ascend.utils import AscendDeviceType, enable_custom_op, get_ascend_device_type
 
@@ -528,6 +529,7 @@ class SparseKVOffloadManager:
         self.topk_buffer_size = sparse_kv_offload_config.topk_buffer_size
         self.topk = sparse_kv_offload_config.topk
         self.use_fused_overlap = sparse_kv_offload_config.use_fused_overlap
+        self.hit_rate_stats: HitRateStats | None = None
         self.use_fused_copy_sfa = sparse_kv_offload_config.use_fused_copy_sfa
 
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
@@ -619,6 +621,8 @@ class SparseKVOffloadManager:
             raise ValueError("Sparse KV offload did not find SFA KV cache layers.")
 
         self.num_layers = len(self.offload_layer_names)
+        if self.sparse_kv_offload_config.collect_hit_rate:
+            self.hit_rate_stats = HitRateStats(self.use_fused_overlap, self.offload_layer_names, "npu")
         self.layer_name_to_offload_id = {
             layer_name: layer_id for layer_id, layer_name in enumerate(self.offload_layer_names)
         }
@@ -634,6 +638,13 @@ class SparseKVOffloadManager:
             if len(self.offload_layer_names) > 4:
                 preview_layer_names += ["..."] + self.offload_layer_names[-4:]
             logger.info("Sparse KV offload layer names: %s", preview_layer_names)
+
+    def report_hit_rate_on_request_finished(self, req_id: str) -> None:
+        # Completion notification runs outside graph capture. TP replicas count
+        # the same accesses, so report once per DP worker group, on TP0 only.
+        if self.hit_rate_stats is not None and self.tp_rank == 0:
+            torch_npu.npu.synchronize()
+            self.hit_rate_stats.log_summary(logger, req_id)
 
     def _get_offload_layer_id(self, layer_name: str) -> int:
         layer_id = self.layer_name_to_offload_id.get(layer_name)

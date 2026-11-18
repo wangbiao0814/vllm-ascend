@@ -359,3 +359,81 @@ convolution allocates its output separately.
 Small prefix match units can increase checkpoint traffic.
 
 Validate correctness, quality and performance on the deployment hardware before deploying in production.
+
+## Sparse KV cache hit-rate diagnostics
+
+| Key under `sparse_kv_offload_config` | Type | Default | Behavior |
+| --- | --- | --- | --- |
+| `collect_hit_rate` | bool | `false` | Accumulate per-layer selected stable-prefix accesses and hits on NPU, including ACLGraph replay. |
+
+Set `enabled=true` and `collect_hit_rate=true`, then run separate processes with
+`use_fused_overlap=false` (LIM + Copy-SFA) and `use_fused_overlap=true`
+(CPU LRU external plan). Keep prompts, generation settings, concurrency and cache
+capacity fixed. These modes use different eviction policies and buffer layouts;
+this is a comparison of the two execution modes, not an isolated kernel benchmark.
+
+Counters measure TopK **occurrences**, not the deduplicated request-level Miss
+Union. They exclude invalid selections, non-offload LIM rows, and Token IDs outside
+the stable offloaded prefix. Cold first-fill misses are included. Tail/current KV
+and layers reusing another layer's TopK selection are excluded. Consequently, this
+measures cache hits at fresh selection time, not the percentage of all attention
+KV reads served from HBM. Short dense requests are excluded in LIM mode; use long
+requests that offload in both modes for a meaningful comparison.
+
+For offline measurement, use the worker callables after model initialization and
+graph warmup, with no concurrent generation:
+
+```python
+import json
+
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.hit_rate import (
+    get_hit_rate_stats,
+    reset_hit_rate_stats,
+)
+
+# llm was constructed with additional_config={"sparse_kv_offload_config": {
+#     "enabled": True, "collect_hit_rate": True, "use_fused_overlap": False,
+#     ... deployment-specific options ...
+# }}
+llm.collective_rpc(reset_hit_rate_stats)
+outputs = llm.generate(prompts, sampling_params)
+results = llm.collective_rpc(get_hit_rate_stats)
+print(json.dumps(results, indent=2))
+```
+
+Each worker returns mode, per-layer counts, and an access-weighted total hit rate
+(`null` when there were no eligible accesses). TP ranks replicate observations;
+compare TP rank 0 per DP group rather than summing every TP replica. Reset clears
+counters in place without changing graph addresses or cache residency. To measure
+a cold workload, use new requests after reset. Capture/warmup counts are discarded
+by the explicit reset. Snapshots synchronize the NPU and should be taken only at
+measurement boundaries. There is no per-step Python logging or device-to-host
+read in the captured path.
+
+Overlap diagnostics add a dependency on the planner stream and an asynchronous
+host-to-device copy of the encoded plan. Both modes add reductions and int64
+counter updates. Disable collection for production latency measurements. All
+counter storage is allocated before graph capture; inputs and plan contents are
+read again on replay. An Ascend graph replay test is provided in
+`tests/ut/distributed/kv_transfer/sparse_kv_offload/test_hit_rate.py`.
+
+With collection enabled, the v2 worker also prints one TP0 summary when a request
+is removed after completion. The line includes `hits`, `misses`, `accesses` and
+`hit_rate`, summed across all instrumented layers:
+
+```text
+[sparse_kv_hit_rate] request_finished=... use_fused_overlap=False scope=cumulative_all_layers hits=15000 misses=5000 accesses=20000 hit_rate=0.750000
+```
+
+These are cumulative totals since initialization or the latest explicit reset,
+not counters attributed exclusively to the finished request. Under concurrency,
+they include work already executed for other requests. Completion summaries do
+not reset counters; the final summary therefore includes the complete measured
+workload. This notification runs outside graph capture and synchronizes the NPU
+on TP0. Empty counters are not logged. Use `reset_hit_rate_stats` after warmup to
+exclude startup work from automatic summaries too.
+
+The total line is followed by one `scope=cumulative_layer` line per registered
+layer, containing `layer`, `hits`, `misses`, `accesses` and `hit_rate`. All lines
+use the same snapshot, without additional per-layer device transfers. Layers
+with no eligible accesses show zero counts and `hit_rate=N/A`.

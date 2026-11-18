@@ -739,6 +739,16 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 self.lim_miss_dst[:count],
                 self.lim_misses[:count],
             )
+        stats = get_sparse_kv_offload_manager().hit_rate_stats
+        if stats is not None:
+            stats.record_lim(
+                self._current_layer_name,
+                self.lim_topk_src[:tokens],
+                self.lim_topk_misses[:tokens],
+                metadata.copy_sfa_query_ends,
+                request_state,
+                prefix,
+            )
         if metadata.copy_sfa_reuse_logical_lens is not None:
             # Only draft step 0 saves the selection for later MTP forwards.
             # Target layers consume their current metadata directly.
@@ -1535,6 +1545,20 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 topk_count=topk,
                 seq_lens=actual_seq_lengths_key_decode,
                 cum_query_lens=actual_seq_lengths_query_decode,
+            )
+
+        if manager.hit_rate_stats is not None and not self.skip_topk:
+            if not external_plan_prepared:
+                raise RuntimeError("Hit-rate collection requires the fused_overlap external plan")
+            if _EXTRA_CTX.capturing:
+                torch_npu.npu.current_stream().wait_stream(manager.fused_plan_stream)
+            plan_end = FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_CNT
+            manager.hit_rate_stats.record_overlap(
+                layer_name,
+                topk_indices_decode,
+                selection_membership_map[:num_tokens, plan_end - topk : plan_end],
+                common_inputs.stable_prefix_lens,
+                common_inputs.current_req_ids,
             )
 
         fused_query = torch.cat([ql_nope_decode, q_pe_decode], dim=-1).contiguous()
