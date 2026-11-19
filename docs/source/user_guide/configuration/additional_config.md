@@ -364,7 +364,7 @@ Validate correctness, quality and performance on the deployment hardware before 
 
 | Key under `sparse_kv_offload_config` | Type | Default | Behavior |
 | --- | --- | --- | --- |
-| `collect_hit_rate` | bool | `false` | Accumulate per-layer selected stable-prefix accesses and hits on NPU, including ACLGraph replay. |
+| `collect_hit_rate` | bool | `false` | Count stable-prefix accesses/hits: CPU planner lookups on TP0 for overlap, device-side attention selections for LIM, including replay. |
 
 Set `enabled=true` and `collect_hit_rate=true`, then run separate processes with
 `use_fused_overlap=false` (LIM + Copy-SFA) and `use_fused_overlap=true`
@@ -375,8 +375,11 @@ this is a comparison of the two execution modes, not an isolated kernel benchmar
 Counters measure TopK **occurrences**, not the deduplicated request-level Miss
 Union. They exclude invalid selections, non-offload LIM rows, and Token IDs outside
 the stable offloaded prefix. Cold first-fill misses are included. Tail/current KV
-are excluded. Layers reusing another layer's TopK selection are included at
-attention consumption time. Consequently, this
+are excluded. LIM includes layers reusing another layer's TopK selection at
+attention consumption time. Overlap counts only actual CPU planner lookups;
+`skip_topk` plan reuse does not add accesses, so the corresponding layer counters
+remain zero. The overlap counters stay on CPU and do not copy shared plan memory
+to NPU. Consequently, this
 measures cache hits for selected stable-prefix tokens, not the percentage of all attention
 KV reads served from HBM. Short dense requests are excluded in LIM mode; use long
 requests that offload in both modes for a meaningful comparison.
@@ -403,8 +406,9 @@ print(json.dumps(results, indent=2))
 ```
 
 Each worker returns mode, per-layer counts, and an access-weighted total hit rate
-(`null` when there were no eligible accesses). TP ranks replicate observations;
-compare TP rank 0 per DP group rather than summing every TP replica. Reset clears
+(`null` when there were no eligible accesses). LIM TP ranks replicate observations;
+overlap updates only TP rank 0. Compare TP rank 0 per DP group rather than summing
+every TP replica. Reset clears
 counters in place without changing graph addresses or cache residency. To measure
 a cold workload, use new requests after reset. Capture/warmup counts are discarded
 by the explicit reset. Snapshots synchronize the NPU and should be taken only at
@@ -438,3 +442,6 @@ The total line is followed by one `scope=cumulative_layer` line per registered
 layer, containing `layer`, `hits`, `misses`, `accesses` and `hit_rate`. All lines
 use the same snapshot, without additional per-layer device transfers. Layers
 with no eligible accesses show zero counts and `hit_rate=N/A`.
+
+After updating the CPU overlap counter implementation, rebuild the Ascend native
+extension before running with `collect_hit_rate=true`.

@@ -227,6 +227,7 @@ def _make_plan_manager():
     manager.fused_plan_status_npu = manager.fused_plan_metadata_npu[:1]
     manager.fused_plan_current_linear_slots_npu = manager.fused_plan_metadata_npu[1:]
     manager.current_kv_by_layer = {}
+    manager.hit_rate_stats = None
     manager.fused_overlap_membership_map = None
     manager.fused_overlap_membership_map_rows = 0
     manager.fused_overlap_plan_owner_layer_id = None
@@ -429,6 +430,7 @@ def test_eager_external_plan_copies_inputs_and_preserves_cpp_argument_order():
         manager.lru_workspace_threads,
         manager.lru_workspace_threads,
         manager.lru_visible_seq_lens_ptr,
+        None,
     )
     manager.tp_group.broadcast.assert_called_once_with(manager.fused_plan_metadata_npu, src=0)
 

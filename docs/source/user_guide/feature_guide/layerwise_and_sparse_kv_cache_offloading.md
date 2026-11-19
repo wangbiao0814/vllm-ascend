@@ -180,3 +180,22 @@ python examples/disaggregated_prefill_v1/load_balance_proxy_layerwise_server_exa
 
 For multi-node deployment, advertise reachable addresses instead of
 `0.0.0.0`. Send inference requests to the proxy port (`9000` in this example).
+
+## Hit-rate collection
+
+Set `sparse_kv_offload_config.collect_hit_rate=true` to enable cumulative
+statistics. With `use_fused_overlap=true`, only TP0 counts actual CPU planner
+lookups, including host callbacks executed during graph replay. Positive plan
+entries are hits; valid selected stable-prefix occurrences are accesses,
+including cold misses and repeated selections. Layers reusing a plan through
+`skip_topk` do not add lookups, so their counters remain zero. This measures
+planner lookup reuse, not all-layer attention traffic or prefix-cache hits.
+The non-overlap path continues counting selected occurrences on the device.
+The two paths therefore need not report identical rates.
+
+Overlap counters remain on CPU: collection does not copy the MemFabric plan
+to NPU. Request-completion summaries synchronize pending device/host-callback
+work before reading counters. Explicit resets and snapshots must also happen
+between workloads after synchronization. Warmup/capture can affect counters;
+reset after warmup before comparing workloads. The native extension must be
+rebuilt when updating to this implementation.

@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "sparse_plan_hit_rate.h"
 #include <dlfcn.h>
 #include <torch/extension.h>
 #include <torch/library.h>
@@ -2581,6 +2582,20 @@ HOT_FUNCTION void lru_resident_compact_impl(
   }
 }
 
+// Called on the planner thread after its parallel workers have joined. Host
+// snapshots/resets must synchronize the planner stream before reading counters.
+void record_lru_plan_hit_rate(const at::Tensor& counts, uintptr_t req_ids_ptr,
+                             uintptr_t sources_ptr, uintptr_t prefix_ptr,
+                             uintptr_t plan_ptr, int64_t stride, int64_t rows, int64_t topk) {
+  if (!counts.defined()) {
+    return;
+  }
+  accumulate_sparse_plan_hits(counts.data_ptr<int64_t>(),
+      reinterpret_cast<const int64_t*>(req_ids_ptr), reinterpret_cast<const int32_t*>(sources_ptr),
+      reinterpret_cast<const int32_t*>(prefix_ptr), reinterpret_cast<const int16_t*>(plan_ptr),
+      stride, rows, topk);
+}
+
 HOT_FUNCTION void lru_resident_compact_with_plan_stable_rows(
     int64_t req_ids_ptr, int64_t last_req_ids_ptr, int64_t topk_indices_ptr, int64_t stable_prefix_lens_ptr,
     int64_t slot_to_token_ptr, int64_t lru_slots_ptr, int64_t current_slots_ptr, int64_t miss_count_ptr,
@@ -2588,7 +2603,13 @@ HOT_FUNCTION void lru_resident_compact_with_plan_stable_rows(
     int64_t token_pos_workspace_ptr, int64_t slot_workspace_ptr, int64_t miss_position_workspace_ptr,
     int64_t epochs_ptr, int64_t physical_row_workspace_ptr, int64_t physical_row_capacity,
     int64_t encoded_plan_ptr, int64_t encoded_plan_stride, int64_t num_reqs, int64_t topk, int64_t capacity,
-    int64_t max_token, int64_t workspace_threads, int64_t requested_threads, int64_t visible_seq_lens_ptr) {
+    int64_t max_token, int64_t workspace_threads, int64_t requested_threads, int64_t visible_seq_lens_ptr,
+    const c10::optional<at::Tensor>& hit_counts) {
+  if (hit_counts.has_value()) {
+    TORCH_CHECK(hit_counts->device().is_cpu() && hit_counts->scalar_type() == at::kLong &&
+                hit_counts->is_contiguous() && hit_counts->numel() == 2,
+                "hit_counts must be a contiguous CPU int64 tensor with two elements");
+  }
   TORCH_CHECK(physical_row_workspace_ptr != 0, "stable-row planner requires physical_row_workspace_ptr");
   TORCH_CHECK(physical_row_capacity >= num_reqs, "stable-row planner capacity must cover all logical rows");
   TORCH_CHECK(physical_row_capacity <= std::numeric_limits<int16_t>::max(),
@@ -2603,6 +2624,8 @@ HOT_FUNCTION void lru_resident_compact_with_plan_stable_rows(
                             miss_position_workspace_ptr, epochs_ptr, num_reqs, topk, capacity, max_token,
                             workspace_threads, requested_threads, encoded_plan_ptr, encoded_plan_stride,
                             physical_row_workspace_ptr, physical_row_capacity, visible_seq_lens_ptr);
+  record_lru_plan_hit_rate(hit_counts.value_or(at::Tensor()), req_ids_ptr, topk_indices_ptr,
+                          stable_prefix_lens_ptr, encoded_plan_ptr, encoded_plan_stride, num_reqs, topk);
 }
 
 namespace {
@@ -2634,6 +2657,7 @@ struct LruResidentCompactWithPlanPayload {
   int64_t max_token;
   int64_t workspace_threads;
   int64_t requested_threads;
+  at::Tensor hit_counts;
   bool delete_after_run;
 };
 
@@ -2701,6 +2725,9 @@ void lru_resident_compact_with_plan_callback(void* args) noexcept {
       payload->epochs_ptr, payload->num_reqs, payload->topk, payload->capacity, payload->max_token,
       payload->workspace_threads, payload->requested_threads, payload->encoded_plan_ptr, payload->encoded_plan_stride,
       payload->physical_row_workspace_ptr, payload->physical_row_capacity, payload->visible_seq_lens_ptr);
+  record_lru_plan_hit_rate(payload->hit_counts, payload->req_ids_ptr, payload->topk_indices_ptr,
+                          payload->stable_prefix_lens_ptr, payload->encoded_plan_ptr,
+                          payload->encoded_plan_stride, payload->num_reqs, payload->topk);
   if (payload->delete_after_run) {
     delete payload;
   }
@@ -2715,7 +2742,13 @@ void enqueue_lru_resident_compact_with_plan_stable_rows(
     int64_t token_pos_workspace_ptr, int64_t slot_workspace_ptr, int64_t miss_position_workspace_ptr,
     int64_t epochs_ptr, int64_t physical_row_workspace_ptr, int64_t physical_row_capacity,
     int64_t encoded_plan_ptr, int64_t encoded_plan_stride, int64_t num_reqs, int64_t topk, int64_t capacity,
-    int64_t max_token, int64_t workspace_threads, int64_t requested_threads, int64_t visible_seq_lens_ptr) {
+    int64_t max_token, int64_t workspace_threads, int64_t requested_threads, int64_t visible_seq_lens_ptr,
+    const c10::optional<at::Tensor>& hit_counts) {
+  if (hit_counts.has_value()) {
+    TORCH_CHECK(hit_counts->device().is_cpu() && hit_counts->scalar_type() == at::kLong &&
+                hit_counts->is_contiguous() && hit_counts->numel() == 2,
+                "hit_counts must be a contiguous CPU int64 tensor with two elements");
+  }
   TORCH_CHECK(physical_row_workspace_ptr != 0, "stable-row planner requires physical_row_workspace_ptr");
   TORCH_CHECK(physical_row_capacity >= num_reqs, "stable-row planner capacity must cover all logical rows");
   TORCH_CHECK(physical_row_capacity <= std::numeric_limits<int16_t>::max(),
@@ -2764,6 +2797,7 @@ void enqueue_lru_resident_compact_with_plan_stable_rows(
           max_token,
           workspace_threads,
           requested_threads,
+          hit_counts.value_or(at::Tensor()),
           !graph_lifetime});
   auto* raw_payload = payload.get();
   if (graph_lifetime) {
@@ -2990,7 +3024,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
             "int miss_position_workspace_ptr, int epochs_ptr, int physical_row_workspace_ptr, "
             "int physical_row_capacity, int encoded_plan_ptr, int encoded_plan_stride, int num_reqs, "
             "int topk, int capacity, int max_token, int workspace_threads, int requested_threads, "
-            "int visible_seq_lens_ptr) -> ()");
+            "int visible_seq_lens_ptr, Tensor(a!)? hit_counts=None) -> ()");
     ops.impl("sparse_kv_lru_resident_compact_with_plan_stable_rows", c10::DispatchKey::CompositeExplicitAutograd,
              &vllm_ascend::lru_resident_compact_with_plan_stable_rows);
 
@@ -3001,7 +3035,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
             "int miss_position_workspace_ptr, int epochs_ptr, int physical_row_workspace_ptr, "
             "int physical_row_capacity, int encoded_plan_ptr, int encoded_plan_stride, int num_reqs, "
             "int topk, int capacity, int max_token, int workspace_threads, int requested_threads, "
-            "int visible_seq_lens_ptr) -> ()");
+            "int visible_seq_lens_ptr, Tensor(a!)? hit_counts=None) -> ()");
     ops.impl("sparse_kv_enqueue_lru_resident_compact_with_plan_stable_rows",
              c10::DispatchKey::CompositeExplicitAutograd,
              &vllm_ascend::enqueue_lru_resident_compact_with_plan_stable_rows);

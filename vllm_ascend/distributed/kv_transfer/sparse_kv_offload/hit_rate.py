@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in device counters. Snapshots and request-completion summaries synchronize with the host."""
+"""Opt-in counters: CPU planner counters for overlap, device counters for LIM."""
 
 import torch
 
@@ -7,13 +7,16 @@ import torch
 class HitRateStats:
     """Count selected stable-prefix occurrences, including cold misses.
 
-    One instance per worker; each layer owns a fixed-address int64 [access, hit]
-    tensor. Updates are captured in ACLGraph and execute on every replay.
+    Each layer owns an int64 [access, hit] tensor. Overlap counters are
+    updated only by actual TP0 CPU planner executions, including graph callbacks;
+    skip_topk plan reuse does not increment them. LIM updates run on device.
+    Synchronize the device before snapshots/resets while using overlap.
     """
 
     def __init__(self, use_fused_overlap: bool, layer_names, device):
         self.use_fused_overlap = use_fused_overlap
-        self.layers = {name: torch.zeros(2, dtype=torch.int64, device=device) for name in layer_names}
+        counter_device = "cpu" if use_fused_overlap else device
+        self.layers = {name: torch.zeros(2, dtype=torch.int64, device=counter_device) for name in layer_names}
 
     def record(self, layer: str, valid: torch.Tensor, hit: torch.Tensor) -> None:
         self.layers[layer].add_(torch.stack((valid.sum(), (valid & hit).sum())))
@@ -28,15 +31,6 @@ class HitRateStats:
         valid = valid_rows[:, None] & offloaded[:, None] & (sources >= 0) & (sources < prefix_lengths[requests, None])
         positions = torch.arange(sources.shape[1], device=sources.device)
         self.record(layer, valid, positions[None, :] >= misses[:, None])
-
-    def record_overlap(self, layer, sources, plan, prefix_lengths, request_ids):
-        sources = sources.reshape(sources.shape[0], -1)
-        valid = (sources >= 0) & (sources < prefix_lengths[:, None]) & (request_ids[:, None] >= 0)
-        # External plans encode hit as slot+1, miss as -(slot+1), padding as 0.
-        # The planner publishes into registered host memory. Capture the H2D
-        # copy after the planner stream dependency, never inspect it in Python.
-        plan = plan.to(device=sources.device, non_blocking=True)
-        self.record(layer, valid, plan > 0)
 
     def reset(self) -> None:
         # Call between workloads, with no concurrent generate/replay.
@@ -105,8 +99,8 @@ def reset_hit_rate_stats(worker):
     stats = get_sparse_kv_offload_manager().hit_rate_stats
     if stats is None:
         raise RuntimeError("Enable sparse_kv_offload_config.collect_hit_rate first")
-    stats.reset()
     torch.npu.synchronize()
+    stats.reset()
 
 
 def get_hit_rate_stats(worker):

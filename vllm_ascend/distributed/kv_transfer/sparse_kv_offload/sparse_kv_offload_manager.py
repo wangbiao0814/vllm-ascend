@@ -1377,6 +1377,7 @@ class SparseKVOffloadManager:
                 self.lru_workspace_threads,
                 self.lru_workspace_threads,
                 self.lru_visible_seq_lens_ptr,
+                self.hit_rate_stats.layers[layer_name] if self.hit_rate_stats is not None else None,
             )
 
         if capturing:
