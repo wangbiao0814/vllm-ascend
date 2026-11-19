@@ -375,8 +375,9 @@ this is a comparison of the two execution modes, not an isolated kernel benchmar
 Counters measure TopK **occurrences**, not the deduplicated request-level Miss
 Union. They exclude invalid selections, non-offload LIM rows, and Token IDs outside
 the stable offloaded prefix. Cold first-fill misses are included. Tail/current KV
-and layers reusing another layer's TopK selection are excluded. Consequently, this
-measures cache hits at fresh selection time, not the percentage of all attention
+are excluded. Layers reusing another layer's TopK selection are included at
+attention consumption time. Consequently, this
+measures cache hits for selected stable-prefix tokens, not the percentage of all attention
 KV reads served from HBM. Short dense requests are excluded in LIM mode; use long
 requests that offload in both modes for a meaningful comparison.
 
@@ -417,8 +418,8 @@ counter storage is allocated before graph capture; inputs and plan contents are
 read again on replay. An Ascend graph replay test is provided in
 `tests/ut/distributed/kv_transfer/sparse_kv_offload/test_hit_rate.py`.
 
-With collection enabled, the v2 worker also prints one TP0 summary when a request
-is removed after completion. The line includes `hits`, `misses`, `accesses` and
+With collection enabled, the v2 worker also prints one TP0 summary when the scheduler reports nonempty
+`finished_req_ids`. Defer/removal callbacks do not trigger summaries. The line includes `hits`, `misses`, `accesses` and
 `hit_rate`, summed across all instrumented layers:
 
 ```text

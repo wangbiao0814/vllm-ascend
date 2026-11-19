@@ -91,6 +91,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwis
 )
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     allocate_kv_offload_topk_profile_buffers,
+    get_sparse_kv_offload_manager,
     init_sparse_kv_offload_manager,
 )
 from vllm_ascend.hisparse.host_mirror import HostMirrorConnector, overlap_target_host_mirror
@@ -699,6 +700,11 @@ class NPUModelRunner(GPUModelRunner):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ):
+        sparse_cfg = self.ascend_config.sparse_kv_offload_config
+        if sparse_cfg.enabled and sparse_cfg.collect_hit_rate and not dummy_run and not is_profile:
+            manager = get_sparse_kv_offload_manager()
+            manager.report_hit_rate_on_requests_finished(scheduler_output.finished_req_ids)
+
         if isinstance(mirror := getattr(self, "kv_connector", None), HostMirrorConnector):
             mirror.begin_execution(not dummy_run and not is_profile)
 

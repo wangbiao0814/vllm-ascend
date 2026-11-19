@@ -123,3 +123,60 @@ def test_completion_summary_aggregates_layers_without_reset():
     logger.reset_mock()
     stats.log_summary(logger, "empty")
     logger.info.assert_not_called()
+
+
+def test_completion_reporting_requires_scheduler_finished_ids():
+    import ast
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    root = Path(__file__).parents[5] / "vllm_ascend"
+    manager_tree = ast.parse(
+        (root / "distributed/kv_transfer/sparse_kv_offload/sparse_kv_offload_manager.py").read_text()
+    )
+    method = next(
+        node
+        for node in ast.walk(manager_tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "report_hit_rate_on_requests_finished"
+    )
+    npu = Mock()
+    logger = Mock()
+    namespace = {"torch_npu": SimpleNamespace(npu=npu), "logger": logger}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), "report", "exec"), namespace)
+    report = namespace[method.name]
+    stats = Mock()
+    manager = SimpleNamespace(hit_rate_stats=stats, tp_rank=0)
+    report(manager, set())  # deferred/unscheduled, no terminal scheduler notification
+    stats.log_summary.assert_not_called()
+    npu.synchronize.assert_not_called()
+    report(manager, {"done-b", "done-a"})
+    stats.log_summary.assert_called_once_with(logger, "done-a,done-b")
+    stats.reset_mock()
+    manager.tp_rank = 1
+    report(manager, {"done"})
+    stats.log_summary.assert_not_called()
+    runner_tree = ast.parse((root / "worker/v2/model_runner.py").read_text())
+    execute = next(
+        node for node in ast.walk(runner_tree) if isinstance(node, ast.FunctionDef) and node.name == "execute_model"
+    )
+    assert "scheduler_output.finished_req_ids" in ast.unparse(execute)
+    assert "not dummy_run" in ast.unparse(execute)
+    # Removal can also mean deferral; it must never report completion itself.
+    state_tree = ast.parse((root / "worker/v2/model_states/default.py").read_text())
+    remove = next(
+        node for node in ast.walk(state_tree) if isinstance(node, ast.FunctionDef) and node.name == "remove_request"
+    )
+    assert "report_hit_rate" not in ast.unparse(remove)
+
+
+def test_shared_indexer_layers_are_counted_at_attention_consumption():
+    import ast
+
+    source = Path(__file__).parents[5] / "vllm_ascend/attention/sfa_kv_offload.py"
+    tree = ast.parse(source.read_text())
+    methods = {node.name: node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+    assert "record_lim" not in ast.unparse(methods["_lim_select"])
+    assert "record_lim" in ast.unparse(methods["_copy_sfa_attention"])
+    assert "hit_rate_stats is not None and (not self.skip_topk)" not in ast.unparse(
+        methods["_execute_fused_overlap_offload_decode"]
+    )

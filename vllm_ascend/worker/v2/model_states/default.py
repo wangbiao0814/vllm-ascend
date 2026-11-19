@@ -343,7 +343,6 @@ class AscendModelState(DefaultModelState):
     def remove_request(self, req_id: str) -> None:
         super().remove_request(req_id)
         if self._offload_request_identity is not None:
-            get_sparse_kv_offload_manager().report_hit_rate_on_request_finished(req_id)
             self._offload_request_identity.remove(req_id)
         if self._offload_request_states is not None:
             self._offload_request_states.remove_request(req_id)

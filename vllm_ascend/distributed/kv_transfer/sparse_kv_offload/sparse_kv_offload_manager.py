@@ -639,12 +639,12 @@ class SparseKVOffloadManager:
                 preview_layer_names += ["..."] + self.offload_layer_names[-4:]
             logger.info("Sparse KV offload layer names: %s", preview_layer_names)
 
-    def report_hit_rate_on_request_finished(self, req_id: str) -> None:
+    def report_hit_rate_on_requests_finished(self, req_ids) -> None:
         # Completion notification runs outside graph capture. TP replicas count
         # the same accesses, so report once per DP worker group, on TP0 only.
-        if self.hit_rate_stats is not None and self.tp_rank == 0:
+        if req_ids and self.hit_rate_stats is not None and self.tp_rank == 0:
             torch_npu.npu.synchronize()
-            self.hit_rate_stats.log_summary(logger, req_id)
+            self.hit_rate_stats.log_summary(logger, ",".join(sorted(req_ids)))
 
     def _get_offload_layer_id(self, layer_name: str) -> int:
         layer_id = self.layer_name_to_offload_id.get(layer_name)
