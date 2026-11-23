@@ -445,3 +445,21 @@ with no eligible accesses show zero counts and `hit_rate=N/A`.
 
 After updating the CPU overlap counter implementation, rebuild the Ascend native
 extension before running with `collect_hit_rate=true`.
+
+## Experimental age eviction for Sparse KV offload
+
+| Key under `sparse_kv_offload_config` | Type | Default | Behavior |
+| --- | --- | --- | --- |
+| `eviction_policy` | `"score"` or `"age"` | `"score"` | Select the original LIM score ranking or experimental resident-age ranking. Age requires MTP=0, FP16/BF16 Indexer and `use_fused_overlap=false`. |
+| `probation_age` | int, 0–524287 | `4` | Initial age of newly loaded tokens for the age policy. Old resident ages increment once per Query, actual hits reset to zero, and ages saturate at 524287. |
+
+Existing deployments keep the score policy. To opt in, rebuild the Ascend
+extension and set `eviction_policy="age"` in the existing offload config. The
+age array is indexed by Source and persists in NPU memory alongside the existing
+Source-to-Slot pool; it adds four bytes per Source per pool row per state owner.
+It does not introduce a reverse mapping. The original TopK and candidate
+protection rules are retained, including the original threshold-tie fallback.
+For usage and server test instructions, see the
+[operator README](https://github.com/vllm-project/vllm-ascend/tree/main/csrc/attention/fused_lightning_indexer_age_manage).
+The first implementation needs CANN compilation, ACLGraph and model accuracy
+verification on supported NPU hardware before production use.

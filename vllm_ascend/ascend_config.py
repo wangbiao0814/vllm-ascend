@@ -1789,6 +1789,8 @@ class SparseKVOffloadConfig:
     topk: int = dataclasses.field(default=0, init=False)
     use_fused_overlap: bool = False
     collect_hit_rate: bool = False
+    eviction_policy: Literal["score", "age"] = "score"
+    probation_age: int = 4
 
     @property
     def use_fused_copy_sfa(self) -> bool:
@@ -1797,6 +1799,12 @@ class SparseKVOffloadConfig:
 
     @model_validator(mode="after")
     def _validate_values(self):
+        if self.eviction_policy not in ("score", "age"):
+            raise ValueError("sparse_kv_offload_config.eviction_policy must be score or age")
+        if not 0 <= self.probation_age <= (1 << 19) - 1:
+            raise ValueError("sparse_kv_offload_config.probation_age must be in [0, 524287]")
+        if self.eviction_policy == "age" and self.use_fused_overlap:
+            raise ValueError("Age eviction requires use_fused_overlap=false")
         if self.topk_buffer_size != -1 and self.topk_buffer_size <= 0:
             raise ValueError("sparse_kv_offload_config.topk_buffer_size must be -1 or positive")
         if self.dram_size_per_dp_GB <= 0:
@@ -1816,6 +1824,10 @@ class SparseKVOffloadConfig:
             speculative = getattr(vllm_config, "speculative_config", None)
             num_speculative_tokens = speculative.num_speculative_tokens if speculative is not None else 0
             config.topk_buffer_size = (1 + num_speculative_tokens) * 2048
+        if config.eviction_policy == "age":
+            speculative = getattr(vllm_config, "speculative_config", None)
+            if speculative is not None and speculative.num_speculative_tokens > 0:
+                raise ValueError("Age eviction currently supports MTP=0 only")
         config._validate_preconditions(vllm_config)
         return config
 

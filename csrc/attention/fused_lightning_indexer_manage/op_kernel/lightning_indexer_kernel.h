@@ -65,6 +65,13 @@ public:
                                 __gm__ uint8_t *routeMissCounts,
                                 __gm__ uint8_t *workspace, const FusedLightningIndexerManageTilingData *__restrict tiling, TPipe *tPipe);
     __aicore__ inline void Process();
+#ifdef LIM_AGE_POLICY
+    __aicore__ inline void InitAge(GM_ADDR ages, GM_ADDR budgets, uint32_t capacity) {
+        cacheTokensAgeGm.SetGlobalBuffer((__gm__ int32_t *)budgets);
+        ageSourceCapacity = capacity;
+        if ASCEND_IS_AIV { vectorService.InitAge(ages); }
+    }
+#endif
 
     // =================================类型定义区=================================
     using Q_T = typename LIT::queryType;
@@ -133,6 +140,10 @@ protected:
     LICommon::ConstInfo constInfo{};
     TempLoopInfo tempLoopInfo{};
     LICommon::SplitCoreInfo splitCoreInfo{};
+#ifdef LIM_AGE_POLICY
+    GlobalTensor<int32_t> cacheTokensAgeGm;
+    uint32_t ageSourceCapacity = 0U;
+#endif
 
     // ================================Init functions==================================
     __aicore__ inline void InitTilingData(const FusedLightningIndexerManageTilingData *__restrict tilingData);
@@ -258,6 +269,16 @@ __aicore__ inline void LIPreload<LIT>::GetS1S2ActualSeqLen(uint32_t bIdx, uint32
     const uint32_t queryEnd = actualSeqLengthsGmQ.GetValue(bIdx);
     const uint32_t queryStart = bIdx == 0U ? 0U : actualSeqLengthsGmQ.GetValue(bIdx - 1U);
     const int32_t state = requestStateGm.GetValue(bIdx);
+#ifdef LIM_AGE_POLICY
+    if (actS1Size != 1U || queryEnd != bIdx + 1U ||
+        (!IsCausal(bIdx) && !LIMAge::ValidGeometry(
+            static_cast<int32_t>(actS2Size), cacheTokensAgeGm.GetValue(bIdx),
+            actualSeqLengthsGm.GetValue(bIdx), ageSourceCapacity))) {
+        actS1Size = 0U;
+        actS2Size = 0U;
+        return;
+    }
+#endif
     if (queryEnd <= queryStart || queryEnd > totalQueries ||
         queryEnd - queryStart > LIMConfig::MAX_ROUTES ||
         (state != LIMConfig::REQUEST_STATE_NON_OFFLOAD &&

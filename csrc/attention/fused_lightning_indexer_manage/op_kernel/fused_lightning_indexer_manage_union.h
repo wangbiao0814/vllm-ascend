@@ -161,6 +161,12 @@ __aicore__ inline void Sync(HardEvent e)
 
 class MtpMissUnion {
 public:
+#ifdef LIM_AGE_POLICY
+    __aicore__ inline void InitAge(GM_ADDR ages, uint32_t probation) {
+        agesGm_.SetGlobalBuffer((__gm__ int32_t *)ages);
+        probationAge_ = probation;
+    }
+#endif
     __aicore__ inline void Init(GM_ADDR pair0, GM_ADDR pair1,
                                 GM_ADDR candidateLengths, GM_ADDR actualSeqLengthsQuery,
                                 GM_ADDR actualSeqLengthsKey, GM_ADDR requestState,
@@ -214,10 +220,70 @@ public:
     {
         for (uint32_t batch = first; batch < batchSize; batch += stride) {
             ProcessBatch(batch);
+#ifdef LIM_AGE_POLICY
+            FinishAge(batch);
+#endif
         }
     }
 
 private:
+#ifdef LIM_AGE_POLICY
+    GlobalTensor<int32_t> agesGm_;
+    uint32_t probationAge_ = 0U;
+
+    __aicore__ inline void WriteAge(uint64_t offset, int32_t value) {
+        agesGm_.SetValue(offset, value);
+        // Scalar writes must be visible to MTE2 candidate reads and next replay.
+        DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(agesGm_[offset]);
+    }
+
+    __aicore__ inline int32_t LoadAgeCount(GlobalTensor<int32_t> gm, uint64_t offset) {
+        LocalTensor<int32_t> local = occurrenceBuf.Get<uint32_t>().ReinterpretCast<int32_t>();
+        DataCopyPad(local, gm[offset], AscendC::DataCopyExtParams{1, sizeof(int32_t), 0, 0, 0},
+                    AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
+        Sync<HardEvent::MTE2_S>(HardEvent::MTE2_S);
+        return local.GetValue(0);
+    }
+
+    __aicore__ inline void ClearAgeHits(uint32_t query, uint32_t row) {
+        const int32_t misses = LoadAgeCount(routeMissCountsGm, static_cast<uint64_t>(query) * ROUTE_COUNT_STRIDE);
+        if (misses < 0 || misses > static_cast<int32_t>(TOPK)) return;
+        LocalTensor<int32_t> sources = pairInBuf.Get<float>().ReinterpretCast<int32_t>();
+        DataCopyPad(sources, topkSourcesGm[static_cast<uint64_t>(query) * TOPK],
+                    AscendC::DataCopyExtParams{1, TOPK * sizeof(int32_t), 0, 0, 0},
+                    AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
+        Sync<HardEvent::MTE2_S>(HardEvent::MTE2_S);
+        for (uint32_t i = static_cast<uint32_t>(misses); i < TOPK; ++i) {
+            const int32_t source = sources.GetValue(i);
+            if (source >= 0 && static_cast<uint32_t>(source) < sourceCapacity)
+                WriteAge(static_cast<uint64_t>(row) * sourceCapacity + source, 0);
+        }
+    }
+
+    __aicore__ inline void FinishAge(uint32_t batch) {
+        const int32_t state = requestStateGm.GetValue(batch);
+        if (state != LIMConfig::REQUEST_STATE_STEADY && state != LIMConfig::REQUEST_STATE_FIRST_DECODE) return;
+        const uint32_t end = actualSeqLengthsQueryGm.GetValue(batch);
+        const uint32_t begin = batch == 0 ? 0 : actualSeqLengthsQueryGm.GetValue(batch - 1);
+        int32_t row; uint32_t length, cache;
+        if (end != batch + 1U || end != begin + 1U || !ValidateOffloadRequest(batch, begin, end, row, length, cache)) return;
+        const int32_t count = LoadAgeCount(countsGm, batch);
+        if (count <= 0 || count > static_cast<int32_t>(MISS_CAPACITY)) return;
+        LocalTensor<int32_t> sources = pairInBuf.Get<float>().ReinterpretCast<int32_t>();
+        for (uint32_t start = 0; start < static_cast<uint32_t>(count); start += EVICT_CHUNK) {
+            const uint32_t n = LICommon::Min(EVICT_CHUNK, static_cast<uint32_t>(count) - start);
+            DataCopyPad(sources, missSourcesGm[static_cast<uint64_t>(batch) * MISS_CAPACITY + start],
+                        AscendC::DataCopyExtParams{1, static_cast<uint32_t>(n * sizeof(int32_t)), 0, 0, 0},
+                        AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
+            Sync<HardEvent::MTE2_S>(HardEvent::MTE2_S);
+            for (uint32_t i = 0; i < n; ++i) {
+                const int32_t source = sources.GetValue(i);
+                if (source >= 0 && static_cast<uint32_t>(source) < length)
+                    WriteAge(static_cast<uint64_t>(row) * sourceCapacity + source, static_cast<int32_t>(probationAge_));
+            }
+        }
+    }
+#endif
     // Match the mature Q=4 publication scheme: every request owner uses MTE3
     // to write its disjoint count cells directly.  This avoids scalar-cache
     // line sharing and removes the kernel-wide post-union finalizer.
@@ -1624,6 +1690,18 @@ private:
         }
         Muls(key, key, -1.0F, valid);
         PipeBarrier<PIPE_V>();
+#ifdef LIM_AGE_POLICY
+        LocalTensor<int32_t> age = temp.ReinterpretCast<int32_t>();
+        DataCopyPad(age, agesGm_[static_cast<uint64_t>(cacheRow) * sourceCapacity + start],
+                    AscendC::DataCopyExtParams{1, static_cast<uint32_t>(valid * sizeof(int32_t)), 0, 0, 0},
+                    AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
+        Sync<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+        Cast(key, age, RoundMode::CAST_NONE, valid);
+        PipeBarrier<PIPE_V>();
+        // Positive integral keys keep the existing finite invalid-key protocol.
+        Adds(key, key, 1.0F, valid);
+        PipeBarrier<PIPE_V>();
+#endif
         Duplicate(invalidKey, INVALID_EVICT_KEY, EVICT_CHUNK);
         PipeBarrier<PIPE_V>();
 
@@ -2513,6 +2591,13 @@ private:
         const uint32_t queryEnd =
             static_cast<uint32_t>(actualSeqLengthsQueryGm.GetValue(batch));
         const int32_t state = requestStateGm.GetValue(batch);
+#ifdef LIM_AGE_POLICY
+        if (queryEnd != batch + 1U || queryEnd != queryStart + 1U) {
+            PublishSafeFailure(batch, queryStart, queryEnd);
+            return;
+        }
+#endif
+
         if (state == LIMConfig::REQUEST_STATE_NON_OFFLOAD) {
             if (queryStart >= queryEnd || queryEnd > tSize ||
                 queryEnd - queryStart > MAX_ROUTES) {
@@ -2532,6 +2617,15 @@ private:
             PublishSafeFailure(batch, queryStart, queryEnd);
             return;
         }
+#ifdef LIM_AGE_POLICY
+        int32_t ageRow; uint32_t ageLength, ageCache;
+        if (queryEnd != batch + 1U || queryEnd != queryStart + 1U ||
+            !ValidateOffloadRequest(batch, queryStart, queryEnd, ageRow, ageLength, ageCache)) {
+            PublishSafeFailure(batch, queryStart, queryEnd);
+            return;
+        }
+        ClearAgeHits(queryStart, static_cast<uint32_t>(ageRow));
+#endif
         // Preserve the stable optimized MTP3 implementation when its score
         // and route workspace layout is identical to the legacy branch.
         if (queryEnd - queryStart != ROUTES || queryStart != batch * ROUTES) {

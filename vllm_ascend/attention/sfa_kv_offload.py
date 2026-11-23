@@ -534,6 +534,8 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         self.block_size = self.vllm_config.cache_config.block_size
         self.use_fused_overlap = offload_cfg.use_fused_overlap
         self.use_fused_copy_sfa = offload_cfg.use_fused_copy_sfa
+        self.lim_eviction_policy = offload_cfg.eviction_policy
+        self.lim_probation_age = offload_cfg.probation_age
         self.lim_indexer_owner = self
         self._copy_sfa_metadata: AscendSFAOffloadMetadata | None = None
         if self.use_fused_copy_sfa:
@@ -548,6 +550,8 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 self.lim_slot_map = torch.full(
                     (requests * 2, source_capacity), -(1 << 31), dtype=torch.int32, device=device
                 )
+                if self.lim_eviction_policy == "age":
+                    self.lim_source_ages = torch.zeros_like(self.lim_slot_map)
                 width = 1 + (
                     self.vllm_config.speculative_config.num_speculative_tokens
                     if self.vllm_config.speculative_config
@@ -674,6 +678,8 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         )
 
     def _lim_select(self, query, weights, indexer, indexer_metadata, query_scale=None):
+        if self.lim_eviction_policy == "age" and indexer.enable_sparse_li_c8:
+            raise ValueError("Age eviction currently supports FP16/BF16 Indexer only, not C8")
         metadata = self._copy_sfa_metadata
         assert metadata is not None and metadata.copy_sfa_pool_entries is not None
         count = metadata.copy_sfa_pool_entries.numel()
@@ -718,7 +724,12 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                     (self.lim_topk_src.shape[0], query.shape[1]), dtype=torch.float32, device=query.device
                 )
             assert self.lim_query_scale is not None
-            torch.ops._C_ascend.npu_fused_lightning_indexer_manage(
+            lim_op = torch.ops._C_ascend.npu_fused_lightning_indexer_manage
+            age_args = ()
+            if self.lim_eviction_policy == "age":
+                lim_op = self._require_custom_op("npu_fused_lightning_indexer_age_manage")
+                age_args = (self.lim_source_ages, self.lim_probation_age)
+            lim_op(
                 weights[:tokens].contiguous(),
                 self.lim_query_scale[:tokens],
                 query[:tokens].contiguous(),
@@ -738,6 +749,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 self.lim_miss_src[:count],
                 self.lim_miss_dst[:count],
                 self.lim_misses[:count],
+                *age_args,
             )
         if metadata.copy_sfa_reuse_logical_lens is not None:
             # Only draft step 0 saves the selection for later MTP forwards.

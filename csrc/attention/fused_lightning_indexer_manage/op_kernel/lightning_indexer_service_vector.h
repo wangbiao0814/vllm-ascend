@@ -56,6 +56,10 @@ public:
     using MM1_OUT_T = float;
 
     __aicore__ inline LIVector(){};
+#ifdef LIM_AGE_POLICY
+    __aicore__ inline void InitAge(GM_ADDR ages) { agesGm_.SetGlobalBuffer((__gm__ int32_t *)ages); }
+#endif
+
     __aicore__ inline void ProcessVec(const LICommon::RunInfo &info);
     __aicore__ inline void ProcessLD();
     __aicore__ inline void InitBuffers(TPipe *pipe);
@@ -88,6 +92,10 @@ protected:
     GlobalTensor<K_T> valueOutGm;
     GlobalTensor<int32_t> reqPoolEntriesGm;
     GlobalTensor<int32_t> cacheSlotsGm;
+#ifdef LIM_AGE_POLICY
+    GlobalTensor<int32_t> agesGm_;
+#endif
+
     GlobalTensor<int32_t> slotOutGm;
     GlobalTensor<uint32_t> actualSeqLengthsQueryGm;
     GlobalTensor<int32_t> requestStateGm;
@@ -311,6 +319,41 @@ __aicore__ inline void LIVector<LIT>::PrepareChunkPayload(
                 AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
     SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
 
+#ifdef LIM_AGE_POLICY
+    // Q=1: both AIVs prepare payloads, but only the even AIV owns age writes.
+    if ((blockId_ & 1U) == 0U &&
+        requestStateGm.GetValue(batchIdx) == LIMConfig::REQUEST_STATE_STEADY) {
+        LocalTensor<int32_t> age = reduceOutBuf_.Get<int32_t>();
+        LocalTensor<float> value = reduceOutBuf_.Get<float>()[s2BaseSize_];
+        LocalTensor<uint32_t> sign = reduceOutBuf_.Get<uint32_t>()[2U * s2BaseSize_];
+        LocalTensor<uint8_t> mask = reduceOutBuf_.Get<uint8_t>()[3U * s2BaseSize_ * sizeof(int32_t)];
+        DataCopyPad(age, agesGm_[cacheRowBase + sourceBase],
+                    AscendC::DataCopyExtParams{1, static_cast<uint32_t>(validLen * sizeof(int32_t)), 0, 0, 0},
+                    AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
+        SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+        Cast(value, age, RoundMode::CAST_NONE, validLen);
+        PipeBarrier<PIPE_V>();
+        Maxs(value, value, 0.0F, validLen);
+        PipeBarrier<PIPE_V>();
+        Mins(value, value, static_cast<float>(LIMAge::MAX_AGE - 1), validLen);
+        PipeBarrier<PIPE_V>();
+        Adds(value, value, 1.0F, validLen);
+        ShiftRight(sign, payloadLocal.template ReinterpretCast<uint32_t>(), 31U, validLen);
+        PipeBarrier<PIPE_V>();
+        CompareScalar(mask, sign.ReinterpretCast<int32_t>(), 0, CMPMODE::EQ, validLen);
+        PipeBarrier<PIPE_V>();
+        LocalTensor<float> zero = sign.ReinterpretCast<float>();
+        Duplicate(zero, 0.0F, validLen);
+        PipeBarrier<PIPE_V>();
+        Select(value, mask, value, zero, SELMODE::VSEL_TENSOR_TENSOR_MODE, validLen);
+        PipeBarrier<PIPE_V>();
+        Cast(age, value, RoundMode::CAST_RINT, validLen);
+        SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
+        DataCopyPad(agesGm_[cacheRowBase + sourceBase], age,
+                    AscendC::DataCopyExtParams{1, static_cast<uint32_t>(validLen * sizeof(int32_t)), 0, 0, 0});
+        SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
+    }
+#endif
     Maxs(payloadLocal, payloadLocal, constInfo_.INVALID_IDX, validLen);
     PipeBarrier<PIPE_V>();
     ShiftLeft(payloadLocal.template ReinterpretCast<uint32_t>(),
