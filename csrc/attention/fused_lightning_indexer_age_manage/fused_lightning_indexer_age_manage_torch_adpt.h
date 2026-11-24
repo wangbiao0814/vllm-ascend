@@ -114,7 +114,7 @@ inline void npu_fused_lightning_indexer_age_manage(
   }
 
   EXEC_NPU_CMD(
-      aclnnFusedLightningIndexerAgeManage,
+      aclnnFusedLightningIndexerAgeManageV2,
       index_weights, query_dequant_scale, query, index_key_dequant_scale,
       index_key_cache, index_block_table, actual_seq_lengths_query,
       actual_seq_lengths_key, offload_seq_lengths_key, num_cache_tokens,

@@ -162,3 +162,31 @@ locally. The diagnostic NPU tests cover all eight flag combinations and expected
 age state changes, but CANN compilation and NPU execution remain unverified
 locally. This branch is based on the previously pushed single-query version;
 it does not include unrelated uncommitted multi-query work from another checkout.
+
+### ACLNN ABI regeneration fix
+
+The diagnostic binding uses the versioned public ACLNN V2 entry points. The
+original single-attribute public ABI remains available and forwards with flags
+zero. Forwarders include the generated inner header instead of manually declaring
+its ABI, so stale generated signatures now fail during compilation.
+
+The opbuild generation command now depends on the operator definitions and the
+generator library. Previously an incremental build could rebuild that library
+without regenerating existing ACLNN source/header outputs. A CPU CMake regression
+test reproduces this failure before the fix and verifies regeneration afterward.
+This explains a possible `topkSrcIdsOut != nullptr` failure when a new diagnostic
+integer was interpreted as an output pointer; actual runtime library selection
+must still match the rebuilt package.
+
+After updating this branch, rebuild in the same server environment and launch a
+new Python process:
+
+```bash
+python3 -m pip install -v -e . --no-deps --no-build-isolation
+```
+
+Inspect the build log for regenerated inner ACLNN sources. If V2 API lookup
+fails, inspect the loaded vendor-library paths for an older installation.
+The CPU tests validate generation dependencies, forwarding argument positions,
+legacy flags-zero forwarding, and compile-time rejection of a stale header;
+they do not replace CANN compilation or NPU runtime validation.

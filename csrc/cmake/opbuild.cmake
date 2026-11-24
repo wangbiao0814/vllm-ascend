@@ -32,6 +32,7 @@ function(gen_opbuild_target)
   )
 
   add_custom_command(OUTPUT ${OPBUILD_OUT_SRCS} ${OPBUILD_OUT_HEADERS}
+                     DEPENDS gen_op_host_${OPBUILD_PREFIX} ${OPBUILD_IN_SRCS}
                      COMMAND OPS_PROTO_SEPARATE=1
                              OPS_PROJECT_NAME=${OPBUILD_PREFIX}
                              OPS_ACLNN_GEN=${OPBUILD_GENACLNN}
@@ -268,6 +269,11 @@ function(gen_aclnn_with_opdef)
   endif()
   add_custom_target(opbuild_custom_gen_aclnn_all)
   add_dependencies(opbuild_custom_gen_aclnn_all ${dependency_list})
+  # Handwritten wrappers may include generated inner API declarations. Generate
+  # them before compiling wrappers, not only before linking the final opapi DSO.
+  if(TARGET ${OPHOST_NAME}_opapi_obj)
+    add_dependencies(${OPHOST_NAME}_opapi_obj opbuild_custom_gen_aclnn_all)
+  endif()
   if(opbuild_out_srcs)
     set_source_files_properties(${opbuild_out_srcs} PROPERTIES GENERATED TRUE)
     add_library(opbuild_gen_aclnn_all OBJECT ${opbuild_out_srcs})
