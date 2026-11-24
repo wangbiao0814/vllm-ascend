@@ -23,7 +23,7 @@ pytestmark = pytest.mark.skipif(
 AGE_MAX = (1 << 19) - 1
 
 
-def call_age(case, cache, ages, outputs, probation):
+def call_age(case, cache, ages, outputs, probation, diagnostic_flags=0):
     assert hasattr(torch.ops._C_ascend, "npu_fused_lightning_indexer_age_manage"), "Rebuild the Ascend extension"
     torch.ops._C_ascend.npu_fused_lightning_indexer_age_manage(
         case.index_weights,
@@ -42,6 +42,7 @@ def call_age(case, cache, ages, outputs, probation):
         *outputs,
         ages,
         probation,
+        diagnostic_flags,
     )
 
 
@@ -191,3 +192,41 @@ def test_age_rejects_invalid_contract_and_preserves_invalid_dynamic_row():
     torch.npu.synchronize()
     assert torch.equal(cache.cpu(), before_cache)
     assert torch.equal(ages.cpu(), before_ages)
+
+
+@pytest.mark.parametrize("flags", range(8))
+@torch.inference_mode()
+def test_age_diagnostic_flags_control_state_updates(flags):
+    # Each bit disables only its target stage; the cache plan must remain valid.
+    case = _build_case(q_values=[1], states=[-1], offload_len=8192, cache_tokens=4096)
+    cache = case.cache_seed.clone()
+    initial = cache.cpu()
+    ages = torch.full_like(cache, 7)
+    outputs = _make_outputs(case)
+    call_age(case, cache, ages, outputs, 4, diagnostic_flags=flags)
+    torch.npu.synchronize()
+    expected = torch.full_like(initial, 7)
+    row = case.req_entries[0]
+    prefix = case.offload_key[0]
+    if not flags & 2:
+        expected[row, :prefix] = torch.where(initial[row, :prefix] >= 0, 8, 0)
+    sources = outputs[0][0, 0].cpu().long()
+    hits = sources[initial[row, sources] >= 0]
+    misses = sources[initial[row, sources] < 0]
+    assert hits.numel() > 0 and misses.numel() > 0
+    if not flags & 1:
+        expected[row, hits] = 0
+    if not flags & 4:
+        expected[row, misses] = 4
+    assert torch.equal(ages.cpu(), expected)
+    assert int(outputs[2].cpu()[0]) == misses.numel()
+    assert torch.equal(cache[row].cpu()[sources], outputs[1][0, 0].cpu())
+    _assert_resident_bijection(cache[row].cpu(), prefix, case.cache_tokens[0])
+
+
+@pytest.mark.parametrize("flags", [-1, 8])
+@torch.inference_mode()
+def test_age_rejects_invalid_diagnostic_flags(flags):
+    case = _build_case(q_values=[1], states=[-1], offload_len=8192, cache_tokens=4096)
+    with pytest.raises(RuntimeError, match="diagnostic_flags"):
+        call_age(case, case.cache_seed.clone(), torch.zeros_like(case.cache_seed), _make_outputs(case), 4, flags)

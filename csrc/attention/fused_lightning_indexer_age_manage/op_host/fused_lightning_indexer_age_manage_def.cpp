@@ -52,6 +52,7 @@ public:
         this->Input("source_ages_pool").ParamType(REQUIRED)
             .DataTypeList({ge::DT_INT32}).FormatList({ge::FORMAT_ND}).AutoContiguous();
         this->Attr("probation_age").AttrType(OPTIONAL).Int(4);
+        this->Attr("diagnostic_flags").AttrType(OPTIONAL).Int(0);
 
         this->Output("topk_src_ids").ParamType(REQUIRED)
             .DataTypeList({ge::DT_INT32}).FormatList({ge::FORMAT_ND});

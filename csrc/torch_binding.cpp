@@ -3671,7 +3671,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "Tensor(a!) cache_slots_pool, Tensor(b!) topk_src_ids, "
         "Tensor(c!) topk_dst_slots, Tensor(d!) topk_miss_counts, "
         "Tensor(e!) miss_src_ids, Tensor(f!) miss_dst_slots, "
-        "Tensor(g!) miss_counts, Tensor(h!) source_ages_pool, int probation_age=4) -> ()"
+        "Tensor(g!) miss_counts, Tensor(h!) source_ages_pool, int probation_age=4, int diagnostic_flags=0) -> ()"
     );
     ops.impl("npu_fused_lightning_indexer_age_manage", torch::kPrivateUse1,
              &vllm_ascend::npu_fused_lightning_indexer_age_manage);

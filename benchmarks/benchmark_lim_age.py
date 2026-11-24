@@ -10,11 +10,20 @@ from pathlib import Path
 TOPK = 2048
 HEAD_DIM = 128
 HEADS = 32
+ABLATIONS = {
+    "normal": 0,
+    "no-hit-clear": 1,
+    "no-increment": 2,
+    "no-increment-or-hit-clear": 3,
+    "no-refill": 4,
+    "no-age-writes": 7,
+}
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scenario", choices=["trace", "all-hit"], default="trace")
+    parser.add_argument("--scenario", choices=["trace", "all-hit", "all-miss"], default="trace")
+    parser.add_argument("--ablation", choices=[*ABLATIONS, "all"], default="normal")
     parser.add_argument("--length", type=int, default=16384)
     parser.add_argument("--capacity", type=int, default=8192)
     parser.add_argument("--steps", type=int, default=64)
@@ -31,6 +40,10 @@ def parse_args():
     args = parser.parse_args()
     if not TOPK <= args.capacity <= min(args.length, 32640):
         parser.error("Require 2048 <= capacity <= min(length, 32640)")
+    if args.scenario == "all-miss" and args.length < args.capacity + TOPK:
+        parser.error("all-miss requires length >= capacity + 2048")
+    if args.ablation != "normal" and args.scenario == "trace":
+        parser.error("Diagnostic ablations require all-hit or all-miss; they do not preserve the age policy")
     if args.length % 128 or args.capacity % 128:
         parser.error("length and capacity must be 128-aligned")
     if min(args.steps, args.repeats, args.latency_samples) < 1:
@@ -45,17 +58,18 @@ def parse_args():
 def trace_spec(args):
     # Sample core sources across the history rather than concentrating in one scan block.
     rng = random.Random(args.seed)
-    core_count = TOPK if args.scenario == "all-hit" else round(TOPK * args.core_fraction)
+    core_count = TOPK if args.scenario != "trace" else round(TOPK * args.core_fraction)
     core = sorted(rng.sample(range(args.length), core_count))
     core_set = set(core)
-    residents = (core + [s for s in range(args.length) if s not in core_set])[: args.capacity]
+    background = [s for s in range(args.length) if s not in core_set]
+    residents = (background if args.scenario == "all-miss" else core + background)[: args.capacity]
     return {
         "core_sources": core,
         "query_seeds": [rng.randrange(1 << 31) for _ in range(args.steps)],
         "query_shape": [1, HEADS, HEAD_DIM],
         "key_shape": [(args.length + 128) // 128, 128, 1, HEAD_DIM],
-        "initial_resident_sources": residents if args.scenario == "all-hit" else list(range(args.capacity)),
-        "fixed_query": args.scenario == "all-hit",
+        "initial_resident_sources": residents if args.scenario != "trace" else list(range(args.capacity)),
+        "fixed_query": args.scenario != "trace",
     }
 
 
@@ -99,7 +113,7 @@ def run(args, spec):
         previous = vector
         query = torch.cat((torch.ones(1), vector / vector.norm()))
         queries.append(query.expand(1, HEADS, HEAD_DIM).contiguous().to(device="npu", dtype=dtype))
-    if args.scenario == "all-hit":
+    if args.scenario != "trace":
         # Exactly TOPK positive-score cores; every other key scores zero.
         # Fix Query to e0 so the selected set cannot drift between steps.
         fixed_query = torch.zeros_like(queries[0])
@@ -115,13 +129,17 @@ def run(args, spec):
     results = []
     selections = {}
     with torch.inference_mode():
+        variants = [("score", "baseline")] + [
+            ("age", name) for name in (ABLATIONS if args.ablation == "all" else [args.ablation])
+        ]
         for mode in modes:
-            for policy in ("score", "age"):
+            for policy, ablation in variants:
+                flags = ABLATIONS.get(ablation, 0)
                 cache = case.cache_seed.clone()
                 ages = torch.full_like(cache, args.probation_age)
                 outputs = _make_outputs(case)
 
-                def invoke(policy=policy, cache=cache, outputs=outputs, ages=ages):
+                def invoke(policy=policy, cache=cache, outputs=outputs, ages=ages, flags=flags):
                     if policy == "score":
                         _call_op(case, cache, outputs)
                     else:
@@ -142,6 +160,7 @@ def run(args, spec):
                             *outputs,
                             ages,
                             args.probation_age,
+                            flags,
                         )
 
                 case.query.copy_(queries[0])
@@ -161,6 +180,10 @@ def run(args, spec):
                 misses = []
                 for step, query in enumerate(queries):
                     case.query.copy_(query)
+                    if args.scenario == "all-miss":
+                        # Reset outside timing so every call misses, not just the first one.
+                        cache.copy_(case.cache_seed)
+                        ages.fill_(args.probation_age)
                     if step in sample_steps:
                         # Restore the same pre-step state before each timed call.
                         saved_cache, saved_ages = cache.clone(), ages.clone()
@@ -193,6 +216,9 @@ def run(args, spec):
                         assert count == 0 and int(outputs[5].cpu()[0]) == 0, "All-hit setup produced misses"
                         assert ordered == spec["core_sources"], "All-hit TopK differs from planted core set"
                         assert torch.equal(cache, case.cache_seed), "All-hit call changed the cache map"
+                    if args.scenario == "all-miss":
+                        assert count == TOPK and int(outputs[5].cpu()[0]) == TOPK, "All-miss setup produced hits"
+                        assert ordered == spec["core_sources"], "All-miss TopK differs from planted core set"
                     misses.append(count)
                     row = case.req_entries[0]
                     mapping = cache[row].cpu()
@@ -203,6 +229,9 @@ def run(args, spec):
                 result = {
                     "mode": mode,
                     "policy": policy,
+                    "ablation": ablation,
+                    "diagnostic_flags": flags,
+                    "policy_valid": flags == 0,
                     "hits": accesses - sum(misses),
                     "misses": sum(misses),
                     "accesses": accesses,

@@ -57,7 +57,10 @@ public:
 
     __aicore__ inline LIVector(){};
 #ifdef LIM_AGE_POLICY
-    __aicore__ inline void InitAge(GM_ADDR ages) { agesGm_.SetGlobalBuffer((__gm__ int32_t *)ages); }
+    __aicore__ inline void InitAge(GM_ADDR ages, uint32_t flags) {
+        agesGm_.SetGlobalBuffer((__gm__ int32_t *)ages);
+        diagnosticFlags_ = flags;
+    }
 #endif
 
     __aicore__ inline void ProcessVec(const LICommon::RunInfo &info);
@@ -94,6 +97,7 @@ protected:
     GlobalTensor<int32_t> cacheSlotsGm;
 #ifdef LIM_AGE_POLICY
     GlobalTensor<int32_t> agesGm_;
+    uint32_t diagnosticFlags_ = 0U;
 #endif
 
     GlobalTensor<int32_t> slotOutGm;
@@ -321,7 +325,7 @@ __aicore__ inline void LIVector<LIT>::PrepareChunkPayload(
 
 #ifdef LIM_AGE_POLICY
     // Q=1: both AIVs prepare payloads, but only the even AIV owns age writes.
-    if ((blockId_ & 1U) == 0U &&
+    if ((diagnosticFlags_ & LIMAge::SKIP_INCREMENT) == 0U && (blockId_ & 1U) == 0U &&
         requestStateGm.GetValue(batchIdx) == LIMConfig::REQUEST_STATE_STEADY) {
         LocalTensor<int32_t> age = reduceOutBuf_.Get<int32_t>();
         LocalTensor<float> value = reduceOutBuf_.Get<float>()[s2BaseSize_];

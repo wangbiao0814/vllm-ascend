@@ -90,3 +90,75 @@ further ablations/profiling are needed to attribute their individual costs.
 The full attention matrix arithmetic still runs, but the data distribution is
 intentionally artificial. Results diagnose maintenance overhead rather than
 representative model throughput.
+
+## Diagnostic ablations (requires rebuilding the extension)
+
+The age operator now accepts an optional trailing `diagnostic_flags=0` integer.
+Default zero keeps the full age policy. Bit 1 skips Hit-age clearing, bit 2
+skips scan-time increment, and bit 4 skips Miss-age assignment to P. Values
+0 through 7 are supported. These are low-level experimental operator arguments,
+not model additional-config keys. Nonzero values intentionally break age policy
+semantics and must not be used to draw conclusions about production hit rates.
+The score operator is unchanged. Initialization, score protection, sorting, and
+existing global barriers remain enabled in all ablations.
+
+Rebuild the Ascend extension once, then run all variants without rebuilding:
+
+```bash
+python -m benchmarks.benchmark_lim_age --scenario all-hit --ablation all \
+  --mode both --length 16384 --capacity 8192 --steps 32 \
+  --repeats 30 --latency-samples 8 --output lim_age_all_hit_ablation.json
+
+python -m benchmarks.benchmark_lim_age --scenario all-miss --ablation all \
+  --mode both --length 16384 --capacity 8192 --steps 32 \
+  --repeats 30 --latency-samples 8 --output lim_age_all_miss_ablation.json
+```
+
+| Variant | Flags | Increment | Hit clear | Miss P assignment |
+| --- | --- | --- | --- | --- |
+| `normal` | 0 | on | on | on |
+| `no-hit-clear` | 1 | on | off | on |
+| `no-increment` | 2 | off | on | on |
+| `no-increment-or-hit-clear` | 3 | off | off | on |
+| `no-refill` | 4 | on | on | off |
+| `no-age-writes` | 7 | off | off | off |
+
+Use `--ablation no-hit-clear` etc. to run a single age variant plus score.
+Default `--ablation normal` retains the original benchmark behavior. Nonzero
+flags are restricted to the controlled all-hit/all-miss scenarios in this CLI.
+JSON rows include `ablation`, `diagnostic_flags`, and `policy_valid` (false for
+nonzero flags). Compare medians in the same mode; timings are not necessarily
+additive because removing work can change overlap and synchronization behavior.
+
+For all-hit, normal versus no-hit-clear estimates the effect of Hit clearing;
+normal versus no-increment estimates increment overhead. Flags 3/7 retain age
+initialization checks and barriers but skip both steady-state updates involved
+in all-hit. `no-refill` should retain all-hit work because there are no misses.
+For all-miss, normal versus no-refill isolates the effect of Miss P assignment;
+no-hit-clear should retain almost the same work because there are no hits.
+
+All-miss uses the same fixed positive-score core construction as all-hit, but
+initial residents are selected only from background sources. It requires
+`length >= capacity + 2048`. The initial map and ages are restored **before
+every trace step and every timing repetition**, outside the timed interval.
+Every step asserts exactly 2048 route/request misses. This measures repeated
+independent all-miss calls, not a naturally evolving all-miss workload.
+Victim ordering may change between diagnostic variants because age semantics
+are deliberately altered. All-hit variants still require an unchanged map.
+
+Validation commands:
+
+```bash
+python -m unittest discover \
+  -s tests/ut/distributed/kv_transfer/sparse_kv_offload \
+  -p test_lim_ablation_benchmark.py
+python -m pytest --noconftest -sv \
+  tests/e2e/nightly/single_node/ops/singlecard_ops/test_fused_lightning_indexer_age_manage.py \
+  -k diagnostic_flags
+```
+
+CPU workload checks and existing native age arithmetic checks have been run
+locally. The diagnostic NPU tests cover all eight flag combinations and expected
+age state changes, but CANN compilation and NPU execution remain unverified
+locally. This branch is based on the previously pushed single-query version;
+it does not include unrelated uncommitted multi-query work from another checkout.

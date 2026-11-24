@@ -76,6 +76,7 @@ TILING_DATA_FIELD_DEF(uint32_t, n1Size)
 TILING_DATA_FIELD_DEF(uint32_t, cacheSlotsSize)
 TILING_DATA_FIELD_DEF(uint32_t, scheduleMode)
 TILING_DATA_FIELD_DEF(uint32_t, probationAge)
+TILING_DATA_FIELD_DEF(uint32_t, diagnosticFlags)
 END_TILING_DATA_DEF
 REGISTER_TILING_DATA_CLASS(FusedLightningIndexerAgeManage, FusedLightningIndexerAgeManageTilingData)
 

@@ -4,6 +4,10 @@
 #include <cstdint>
 namespace LIMAge {
 constexpr int32_t MAX_AGE = (1 << 19) - 1;
+constexpr uint32_t SKIP_HIT_CLEAR = 1U;
+constexpr uint32_t SKIP_INCREMENT = 2U;
+constexpr uint32_t SKIP_REFILL = 4U;
+constexpr uint32_t DIAGNOSTIC_MASK = 7U;
 constexpr uint32_t TILE = 512U;
 constexpr uint32_t AGE_INPUT = 13U;
 constexpr uint32_t AGE_OUTPUT = 7U;

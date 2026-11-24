@@ -333,7 +333,7 @@ __aicore__ inline bool FinalizeStandardCounts(
                                                     tiling_data->tSize,                                                  \
                                                     tiling_data->cacheSlotsSize);                                        \
         LIPreload<LIType<__VA_ARGS__, int32_t, true, LI_LAYOUT::TND, LI_LAYOUT::PA_BSND>> op;                           \
-        op.InitAge(sourceAges, cacheTokens, tiling_data->cacheSlotsSize);                                               \
+        op.InitAge(sourceAges, cacheTokens, tiling_data->cacheSlotsSize, tiling_data->diagnosticFlags);                                               \
         op.Init(query, key, weights, reqPoolEntries, cacheSlots, actualSeqLengthsQuery, actualSeqLengthsKey,           \
                 offloadSeqLengthsKey, requestState, blockTable,                                                       \
                 topkSourceIds, topkSlots, unionPair0, unionPair1, scoreScratch, thresholdScratch, routeMissCounts,      \
@@ -358,7 +358,7 @@ __aicore__ inline bool FinalizeStandardCounts(
                                  tiling_data->bSize, tiling_data->tSize, tiling_data->s2Size,                         \
                                  tiling_data->poolSize,                                                                \
                                  tiling_data->cacheSlotsSize, &tPipe);                                                   \
-                    unionOp.InitAge(sourceAges, tiling_data->probationAge);                                            \
+                    unionOp.InitAge(sourceAges, tiling_data->probationAge, tiling_data->diagnosticFlags);                                            \
                     unionOp.Process(unionOwner, unionOwners);                                                          \
                 }                                                                                                       \
             }                                                                                                           \

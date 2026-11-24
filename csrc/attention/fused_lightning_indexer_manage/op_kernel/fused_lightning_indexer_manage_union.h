@@ -162,7 +162,8 @@ __aicore__ inline void Sync(HardEvent e)
 class MtpMissUnion {
 public:
 #ifdef LIM_AGE_POLICY
-    __aicore__ inline void InitAge(GM_ADDR ages, uint32_t probation) {
+    __aicore__ inline void InitAge(GM_ADDR ages, uint32_t probation, uint32_t flags) {
+        diagnosticFlags_ = flags;
         agesGm_.SetGlobalBuffer((__gm__ int32_t *)ages);
         probationAge_ = probation;
     }
@@ -230,6 +231,7 @@ private:
 #ifdef LIM_AGE_POLICY
     GlobalTensor<int32_t> agesGm_;
     uint32_t probationAge_ = 0U;
+    uint32_t diagnosticFlags_ = 0U;
 
     __aicore__ inline void WriteAge(uint64_t offset, int32_t value) {
         agesGm_.SetValue(offset, value);
@@ -261,6 +263,7 @@ private:
     }
 
     __aicore__ inline void FinishAge(uint32_t batch) {
+        if ((diagnosticFlags_ & LIMAge::SKIP_REFILL) != 0U) return;
         const int32_t state = requestStateGm.GetValue(batch);
         if (state != LIMConfig::REQUEST_STATE_STEADY && state != LIMConfig::REQUEST_STATE_FIRST_DECODE) return;
         const uint32_t end = actualSeqLengthsQueryGm.GetValue(batch);
@@ -2624,7 +2627,8 @@ private:
             PublishSafeFailure(batch, queryStart, queryEnd);
             return;
         }
-        ClearAgeHits(queryStart, static_cast<uint32_t>(ageRow));
+        if ((diagnosticFlags_ & LIMAge::SKIP_HIT_CLEAR) == 0U)
+            ClearAgeHits(queryStart, static_cast<uint32_t>(ageRow));
 #endif
         // Preserve the stable optimized MTP3 implementation when its score
         // and route workspace layout is identical to the legacy branch.

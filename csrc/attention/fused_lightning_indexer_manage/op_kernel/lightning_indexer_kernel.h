@@ -66,10 +66,10 @@ public:
                                 __gm__ uint8_t *workspace, const FusedLightningIndexerManageTilingData *__restrict tiling, TPipe *tPipe);
     __aicore__ inline void Process();
 #ifdef LIM_AGE_POLICY
-    __aicore__ inline void InitAge(GM_ADDR ages, GM_ADDR budgets, uint32_t capacity) {
+    __aicore__ inline void InitAge(GM_ADDR ages, GM_ADDR budgets, uint32_t capacity, uint32_t diagnosticFlags) {
         cacheTokensAgeGm.SetGlobalBuffer((__gm__ int32_t *)budgets);
         ageSourceCapacity = capacity;
-        if ASCEND_IS_AIV { vectorService.InitAge(ages); }
+        if ASCEND_IS_AIV { vectorService.InitAge(ages, diagnosticFlags); }
     }
 #endif
 

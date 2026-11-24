@@ -74,3 +74,14 @@ For end-to-end comparison, keep prompts, cache budget, batch size and all other
 settings fixed. Compare per-layer hit/Miss summaries and Decode latency, with
 collection disabled for final latency measurements. Hit-rate improvement alone
 does not establish a throughput improvement.
+
+## Diagnostic-only maintenance flags
+
+The optional trailing operator argument `diagnostic_flags=0` supports a bitmask:
+1 skips Hit clear, 2 skips scan-time increment, and 4 skips Miss assignment to P.
+The default zero preserves normal behavior. Nonzero flags intentionally change
+the age policy; use only for controlled performance ablations, never production
+inference or hit-rate quality comparisons. Rebuild the extension after this API
+addition. No model configuration switch or environment variable is added.
+See [benchmark instructions](../../../benchmarks/README_lim_age.md) for all-hit,
+all-miss and eager/graph commands. The existing score operator is unchanged.

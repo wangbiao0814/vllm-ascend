@@ -13,7 +13,7 @@ aclnnStatus aclnnFusedLightningIndexerAgeManageGetWorkspaceSize(
     const aclTensor *actualSeqLengthsQuery, const aclTensor *actualSeqLengthsKey,
     const aclTensor *offloadSeqLengthsKey, const aclTensor *numCacheTokens,
     const aclTensor *requestState, const aclTensor *reqPoolEntries,
-    const aclTensor *cacheSlotsPool, const aclTensor *sourceAgesPool, int64_t probationAge,
+    const aclTensor *cacheSlotsPool, const aclTensor *sourceAgesPool, int64_t probationAge, int64_t diagnosticFlags,
     const aclTensor *topkSrcIds,
     const aclTensor *topkDstSlots, const aclTensor *topkMissCounts,
     const aclTensor *missSrcIds, const aclTensor *missDstSlots,

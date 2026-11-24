@@ -19,7 +19,7 @@ inline void npu_fused_lightning_indexer_age_manage(
     at::Tensor topk_src_ids, at::Tensor topk_dst_slots,
     at::Tensor topk_miss_counts, at::Tensor miss_src_ids,
     at::Tensor miss_dst_slots, at::Tensor miss_counts,
-    at::Tensor source_ages_pool, int64_t probation_age) {
+    at::Tensor source_ages_pool, int64_t probation_age, int64_t diagnostic_flags) {
   TORCH_CHECK(query.size(0) == index_block_table.size(0), "Age LIM supports MTP=0 only (T=B).");
   TORCH_CHECK(source_ages_pool.sizes() == cache_slots_pool.sizes() &&
               source_ages_pool.scalar_type() == at::kInt &&
@@ -27,6 +27,8 @@ inline void npu_fused_lightning_indexer_age_manage(
               "source_ages_pool must match cache_slots_pool and be contiguous int32 on NPU.");
   TORCH_CHECK(probation_age >= 0 && probation_age <= LIMAge::MAX_AGE,
               "probation_age exceeds the supported age range.");
+  TORCH_CHECK(diagnostic_flags >= 0 && diagnostic_flags <= LIMAge::DIAGNOSTIC_MASK,
+              "diagnostic_flags must be in [0,7]; nonzero is for ablation only.");
   constexpr int64_t kTopK = LIMConfig::TOPK;
   constexpr int64_t kMissCapacity = LIMConfig::MISS_CAPACITY;
   constexpr int64_t kBlockSize = LIMConfig::CACHE_BLOCK_SIZE;
@@ -116,7 +118,7 @@ inline void npu_fused_lightning_indexer_age_manage(
       index_weights, query_dequant_scale, query, index_key_dequant_scale,
       index_key_cache, index_block_table, actual_seq_lengths_query,
       actual_seq_lengths_key, offload_seq_lengths_key, num_cache_tokens,
-      request_state, req_pool_entries, cache_slots_pool, source_ages_pool, probation_age, topk_src_ids,
+      request_state, req_pool_entries, cache_slots_pool, source_ages_pool, probation_age, diagnostic_flags, topk_src_ids,
       topk_dst_slots, topk_miss_counts, miss_src_ids, miss_dst_slots,
       miss_counts, cache_slots_pool, source_ages_pool);
 }
