@@ -65,3 +65,28 @@ python -m benchmarks.benchmark_lim_age --dry-run --output /tmp/lim_age_trace.jso
 ```
 
 NPU compilation and execution of this benchmark remain to be verified on server.
+
+## All-hit diagnostic
+
+```bash
+python -m benchmarks.benchmark_lim_age --scenario all-hit --mode both \
+  --length 16384 --capacity 8192 --steps 32 --repeats 30 \
+  --latency-samples 8 --output lim_age_all_hit.json
+```
+
+This uses exactly 2048 scattered positive-score core sources, zero-score
+background sources, and a fixed unit Query in the first dimension. All core
+sources are resident before the first measured call; the remaining slots contain
+filler sources. Both policies start with identical mappings. The Query/Key
+shapes, full prefix scan and age updates are retained. `core-fraction` and
+`correlation` do not control this diagnostic. No first-fill call is measured.
+
+Every measured step asserts zero route/request misses, the exact planted TopK
+set, and an unchanged cache map. Both policies must report `hit_rate=1.0` and
+`misses=0`; a failure stops the run rather than silently reporting a mixed case.
+This excludes ordinary victim selection and refill work, while retaining age
+increment and 2048 Hit-age clears. It does not isolate increment from Hit clears;
+further ablations/profiling are needed to attribute their individual costs.
+The full attention matrix arithmetic still runs, but the data distribution is
+intentionally artificial. Results diagnose maintenance overhead rather than
+representative model throughput.

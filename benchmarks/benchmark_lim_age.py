@@ -14,6 +14,7 @@ HEADS = 32
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--scenario", choices=["trace", "all-hit"], default="trace")
     parser.add_argument("--length", type=int, default=16384)
     parser.add_argument("--capacity", type=int, default=8192)
     parser.add_argument("--steps", type=int, default=64)
@@ -44,13 +45,17 @@ def parse_args():
 def trace_spec(args):
     # Sample core sources across the history rather than concentrating in one scan block.
     rng = random.Random(args.seed)
-    core = sorted(rng.sample(range(args.length), round(TOPK * args.core_fraction)))
+    core_count = TOPK if args.scenario == "all-hit" else round(TOPK * args.core_fraction)
+    core = sorted(rng.sample(range(args.length), core_count))
+    core_set = set(core)
+    residents = (core + [s for s in range(args.length) if s not in core_set])[: args.capacity]
     return {
         "core_sources": core,
         "query_seeds": [rng.randrange(1 << 31) for _ in range(args.steps)],
         "query_shape": [1, HEADS, HEAD_DIM],
         "key_shape": [(args.length + 128) // 128, 128, 1, HEAD_DIM],
-        "initial_residents": [0, args.capacity],
+        "initial_resident_sources": residents if args.scenario == "all-hit" else list(range(args.capacity)),
+        "fixed_query": args.scenario == "all-hit",
     }
 
 
@@ -94,6 +99,16 @@ def run(args, spec):
         previous = vector
         query = torch.cat((torch.ones(1), vector / vector.norm()))
         queries.append(query.expand(1, HEADS, HEAD_DIM).contiguous().to(device="npu", dtype=dtype))
+    if args.scenario == "all-hit":
+        # Exactly TOPK positive-score cores; every other key scores zero.
+        # Fix Query to e0 so the selected set cannot drift between steps.
+        fixed_query = torch.zeros_like(queries[0])
+        fixed_query[:, :, 0] = 1
+        queries = [fixed_query] * args.steps
+        row = case.req_entries[0]
+        case.cache_seed[row].fill_(-(1 << 31))
+        resident_sources = torch.tensor(spec["initial_resident_sources"], dtype=torch.long, device="npu")
+        case.cache_seed[row, resident_sources] = torch.arange(args.capacity, dtype=torch.int32, device="npu")
     samples = min(args.steps, args.latency_samples)
     sample_steps = {round(i * (args.steps - 1) / max(1, samples - 1)) for i in range(samples)}
     modes = ["eager", "graph"] if args.mode == "both" else [args.mode]
@@ -174,6 +189,10 @@ def run(args, spec):
                         raise AssertionError(f"TopK source sets differ at {mode=} {step=}")
                     count = int(outputs[2].cpu()[0])
                     assert 0 <= count <= TOPK
+                    if args.scenario == "all-hit":
+                        assert count == 0 and int(outputs[5].cpu()[0]) == 0, "All-hit setup produced misses"
+                        assert ordered == spec["core_sources"], "All-hit TopK differs from planted core set"
+                        assert torch.equal(cache, case.cache_seed), "All-hit call changed the cache map"
                     misses.append(count)
                     row = case.req_entries[0]
                     mapping = cache[row].cpu()
