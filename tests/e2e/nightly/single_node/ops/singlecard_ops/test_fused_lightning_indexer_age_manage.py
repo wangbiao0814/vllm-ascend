@@ -135,8 +135,8 @@ def test_age_identity_transition_and_long_sources():
     assert MAX_CACHE_TOKENS > TOPK  # same public slot capacity contract
 
 
-def scan_seed(length):
-    value = (length ^ 0x9E3779B9) & 0xFFFFFFFF
+def scan_seed(length, row):
+    value = (length ^ ((row + 1) * 0x9E3779B9)) & 0xFFFFFFFF
     value ^= value >> 16
     value = (value * 0x7FEB352D) & 0xFFFFFFFF
     value ^= value >> 15
@@ -154,7 +154,7 @@ def test_age_selects_oldest_inside_original_scanned_blocks():
     expected = []
     accumulated = []
     chunks = length // chunk
-    start_chunk = scan_seed(length) % chunks
+    start_chunk = scan_seed(length, case.req_entries[0]) % chunks
     for step in range(chunks):
         begin = ((start_chunk + step) % chunks) * chunk
         candidates = [s for s in range(begin, min(begin + chunk, budget)) if s not in selected]
