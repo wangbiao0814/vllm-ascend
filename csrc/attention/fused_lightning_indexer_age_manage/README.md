@@ -91,3 +91,11 @@ read/modify/write DMA for each touched 512-source block. Local scalar clears
 replace per-Hit GM writes and cache-line flushes. Increment and Miss updates are
 unchanged; rebuild before comparing the existing all-hit diagnostic timings.
 No NPU speedup has been verified locally.
+
+For Hit-clear stage diagnostics, mask 8 runs bucket construction only and mask
+16 retains bucket construction plus block DMA but skips local clearing. Flags
+range from 0 through 31; bit 1 (skip entire Hit clear) takes precedence, then bit
+8 (buckets only). Combine either new mode with bit 2 to disable increment. These
+are not valid production age policies. `--ablation hit-clear-breakdown` in the
+benchmark runs the four comparable no-increment variants. The V2 ABI argument
+list is unchanged; rebuilding is required for flag validation and kernel logic.

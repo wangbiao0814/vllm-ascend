@@ -194,7 +194,7 @@ def test_age_rejects_invalid_contract_and_preserves_invalid_dynamic_row():
     assert torch.equal(ages.cpu(), before_ages)
 
 
-@pytest.mark.parametrize("flags", range(8))
+@pytest.mark.parametrize("flags", range(32))
 @torch.inference_mode()
 def test_age_diagnostic_flags_control_state_updates(flags):
     # Each bit disables only its target stage; the cache plan must remain valid.
@@ -214,7 +214,7 @@ def test_age_diagnostic_flags_control_state_updates(flags):
     hits = sources[initial[row, sources] >= 0]
     misses = sources[initial[row, sources] < 0]
     assert hits.numel() > 0 and misses.numel() > 0
-    if not flags & 1:
+    if not flags & (1 | 8 | 16):
         expected[row, hits] = 0
     if not flags & 4:
         expected[row, misses] = 4
@@ -224,7 +224,7 @@ def test_age_diagnostic_flags_control_state_updates(flags):
     _assert_resident_bijection(cache[row].cpu(), prefix, case.cache_tokens[0])
 
 
-@pytest.mark.parametrize("flags", [-1, 8])
+@pytest.mark.parametrize("flags", [-1, 32])
 @torch.inference_mode()
 def test_age_rejects_invalid_diagnostic_flags(flags):
     case = _build_case(q_values=[1], states=[-1], offload_len=8192, cache_tokens=4096)

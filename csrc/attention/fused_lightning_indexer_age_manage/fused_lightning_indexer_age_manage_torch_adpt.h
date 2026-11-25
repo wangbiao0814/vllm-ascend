@@ -28,7 +28,7 @@ inline void npu_fused_lightning_indexer_age_manage(
   TORCH_CHECK(probation_age >= 0 && probation_age <= LIMAge::MAX_AGE,
               "probation_age exceeds the supported age range.");
   TORCH_CHECK(diagnostic_flags >= 0 && diagnostic_flags <= LIMAge::DIAGNOSTIC_MASK,
-              "diagnostic_flags must be in [0,7]; nonzero is for ablation only.");
+              "diagnostic_flags must be in [0,31]; nonzero is for ablation only.");
   constexpr int64_t kTopK = LIMConfig::TOPK;
   constexpr int64_t kMissCapacity = LIMConfig::MISS_CAPACITY;
   constexpr int64_t kBlockSize = LIMConfig::CACHE_BLOCK_SIZE;

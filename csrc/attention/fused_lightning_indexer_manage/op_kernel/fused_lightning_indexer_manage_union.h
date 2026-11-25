@@ -276,6 +276,12 @@ private:
             LIMAge::AppendHitBlock(sources.GetValue(i), i, sourceCapacity,
                                    heads, next, touched, touchedCount);
         }
+        if ((diagnosticFlags_ & LIMAge::HIT_BUCKETS_ONLY) != 0U) {
+            // Keep bucket construction and its scalar/vector ordering, but
+            // perform no age-tile reads, local clears, or age-tile writes.
+            Sync<HardEvent::S_V>(HardEvent::S_V);
+            return;
+        }
         const uint64_t base = static_cast<uint64_t>(row) * sourceCapacity;
         for (uint32_t i = 0U; i < touchedCount; ++i) {
             const uint32_t block = static_cast<uint32_t>(touched.GetValue(i));
@@ -285,7 +291,8 @@ private:
             DataCopyPad(ageTile, agesGm_[base + start], copy,
                         AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
             Sync<HardEvent::MTE2_S>(HardEvent::MTE2_S);
-            LIMAge::ClearHitBlock(heads.GetValue(block), sources, next, ageTile);
+            if ((diagnosticFlags_ & LIMAge::SKIP_LOCAL_HIT_CLEAR) == 0U)
+                LIMAge::ClearHitBlock(heads.GetValue(block), sources, next, ageTile);
             Sync<HardEvent::S_MTE3>(HardEvent::S_MTE3);
             DataCopyPad(agesGm_[base + start], ageTile, copy);
             // Complete DMA before the next tile reuses ageTile and before

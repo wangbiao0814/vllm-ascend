@@ -96,7 +96,7 @@ representative model throughput.
 The age operator now accepts an optional trailing `diagnostic_flags=0` integer.
 Default zero keeps the full age policy. Bit 1 skips Hit-age clearing, bit 2
 skips scan-time increment, and bit 4 skips Miss-age assignment to P. Values
-0 through 7 are supported. These are low-level experimental operator arguments,
+0 through 31 are supported. These are low-level experimental operator arguments,
 not model additional-config keys. Nonzero values intentionally break age policy
 semantics and must not be used to draw conclusions about production hit rates.
 The score operator is unchanged. Initialization, score protection, sorting, and
@@ -158,7 +158,7 @@ python -m pytest --noconftest -sv \
 ```
 
 CPU workload checks and existing native age arithmetic checks have been run
-locally. The diagnostic NPU tests cover all eight flag combinations and expected
+locally. The diagnostic NPU tests cover all 32 flag combinations and expected
 age state changes, but CANN compilation and NPU execution remain unverified
 locally. This branch is based on the previously pushed single-query version;
 it does not include unrelated uncommitted multi-query work from another checkout.
@@ -218,3 +218,43 @@ tests remain applicable; a new partial-block all-hit NPU regression checks the
 last block and preservation of non-Hit ages. The native CPU regression exercises
 the shared bucket/clear helpers with invalid IDs, repeated Hits, Miss-prefix
 exclusion, empty Hit sets, partial tails, and the maximum Source capacity.
+
+### Hit-clear stage breakdown
+
+The diagnostic flags now also support mask value 8 (build Hit buckets only,
+then return before age block DMA) and 16 (build buckets and DMA-read/write each
+block, but skip local zeroing). Both deliberately leave Hit ages uncleared.
+Bit 1 still skips the entire Hit-clear function; if combined with 8/16 it takes
+precedence. Bit 8 takes precedence over 16. No new ABI parameter is added;
+rebuild the extension for the new flags and range checks.
+
+For the current all-hit investigation run:
+
+```bash
+python -m benchmarks.benchmark_lim_age --scenario all-hit \
+  --ablation hit-clear-breakdown --mode both \
+  --length 16384 --capacity 8192 --steps 32 \
+  --repeats 30 --latency-samples 8 --output lim_hit_clear_breakdown.json
+```
+
+This runs score plus four age variants with increment disabled throughout:
+
+| Age variant | Flags | Build buckets | Read/write age blocks | Clear locally |
+| --- | --- | --- | --- | --- |
+| `no-increment-or-hit-clear` | 3 | off | off | off |
+| `no-increment-hit-buckets-only` | 10 | on | off | off |
+| `no-increment-hit-copy-only` | 18 | on | on | off |
+| `no-increment` | 2 | on | on | on |
+
+For measurements in the same mode and metric, compare flags 10 minus 3 for the
+bucket-stage effect, 18 minus 10 for block DMA/synchronization, and 2 minus 18
+for local clearing/list traversal. These differences are estimates, not isolated
+hardware instruction costs: removing work can change pipeline overlap, cache
+behavior and compiler scheduling. All variants retain zero Misses and an
+unchanged slot map in all-hit; ages intentionally differ. Kernel profiling is
+still needed to validate attribution.
+
+Use `--ablation hit-buckets-only` or `--ablation hit-copy-only` to retain increment
+while testing either new mode. `--ablation all` includes both new modes and their
+no-increment combinations. JSON rows record the exact flags. Existing flag
+values 0 through 7 and the V2 ACLNN parameter order are unchanged.

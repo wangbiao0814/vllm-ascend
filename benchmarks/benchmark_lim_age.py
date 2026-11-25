@@ -10,6 +10,12 @@ from pathlib import Path
 TOPK = 2048
 HEAD_DIM = 128
 HEADS = 32
+HIT_CLEAR_BREAKDOWN = (
+    "no-increment-or-hit-clear",
+    "no-increment-hit-buckets-only",
+    "no-increment-hit-copy-only",
+    "no-increment",
+)
 ABLATIONS = {
     "normal": 0,
     "no-hit-clear": 1,
@@ -17,13 +23,17 @@ ABLATIONS = {
     "no-increment-or-hit-clear": 3,
     "no-refill": 4,
     "no-age-writes": 7,
+    "hit-buckets-only": 8,
+    "hit-copy-only": 16,
+    "no-increment-hit-buckets-only": 10,
+    "no-increment-hit-copy-only": 18,
 }
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scenario", choices=["trace", "all-hit", "all-miss"], default="trace")
-    parser.add_argument("--ablation", choices=[*ABLATIONS, "all"], default="normal")
+    parser.add_argument("--ablation", choices=[*ABLATIONS, "all", "hit-clear-breakdown"], default="normal")
     parser.add_argument("--length", type=int, default=16384)
     parser.add_argument("--capacity", type=int, default=8192)
     parser.add_argument("--steps", type=int, default=64)
@@ -129,9 +139,11 @@ def run(args, spec):
     results = []
     selections = {}
     with torch.inference_mode():
-        variants = [("score", "baseline")] + [
-            ("age", name) for name in (ABLATIONS if args.ablation == "all" else [args.ablation])
-        ]
+        if args.ablation == "hit-clear-breakdown":
+            names = HIT_CLEAR_BREAKDOWN
+        else:
+            names = ABLATIONS if args.ablation == "all" else [args.ablation]
+        variants = [("score", "baseline")] + [("age", name) for name in names]
         for mode in modes:
             for policy, ablation in variants:
                 flags = ABLATIONS.get(ablation, 0)

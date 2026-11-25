@@ -359,7 +359,7 @@ ge::graphStatus FusedLightningIndexerAgeManageTiling::DoTiling(FusedLightningInd
                return ge::GRAPH_FAILED);
     const auto *diagnostic = attrs->GetAttrPointer<int64_t>(1);
     OPS_ERR_IF(diagnostic == nullptr || *diagnostic < 0 || *diagnostic > LIMAge::DIAGNOSTIC_MASK,
-               OPS_LOG_E(tilingInfo->opName, "diagnostic_flags must be in [0,7]."),
+               OPS_LOG_E(tilingInfo->opName, "diagnostic_flags must be in [0,31]."),
                return ge::GRAPH_FAILED);
     tilingData_.set_diagnosticFlags(static_cast<uint32_t>(*diagnostic));
     tilingData_.set_probationAge(static_cast<uint32_t>(*probation));

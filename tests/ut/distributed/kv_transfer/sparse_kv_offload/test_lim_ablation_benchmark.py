@@ -7,10 +7,18 @@ import io
 import unittest
 from unittest.mock import patch
 
-from benchmarks.benchmark_lim_age import TOPK, parse_args, trace_spec
+from benchmarks.benchmark_lim_age import ABLATIONS, HIT_CLEAR_BREAKDOWN, TOPK, parse_args, trace_spec
 
 
 class TestDiagnosticSpec(unittest.TestCase):
+    def test_hit_clear_breakdown_uses_matching_increment_settings(self):
+        self.assertEqual([ABLATIONS[name] for name in HIT_CLEAR_BREAKDOWN], [3, 10, 18, 2])
+        self.assertEqual(ABLATIONS["hit-buckets-only"], 8)
+        self.assertEqual(ABLATIONS["hit-copy-only"], 16)
+        self.assertEqual(ABLATIONS["normal"], 0)
+        with patch("sys.argv", ["bench", "--scenario", "all-hit", "--ablation", "hit-clear-breakdown", "--dry-run"]):
+            self.assertEqual(parse_args().ablation, "hit-clear-breakdown")
+
     def test_diagnostic_cli_rejects_invalid_workloads(self):
         for argv in (
             ["bench", "--scenario", "all-miss", "--length", "8192", "--capacity", "8192"],
