@@ -276,14 +276,34 @@ private:
         LocalTensor<uint32_t> sorted = occurrenceBuf.Get<uint32_t>();
         LIServiceVec::ExtractIndex(sorted, sortInput.ReinterpretCast<uint32_t>(), TOPK);
         Sync<HardEvent::V_S>(HardEvent::V_S);
+        if ((diagnosticFlags_ & LIMAge::HIT_SORT_ONLY) != 0U) return;
         LocalTensor<int32_t> sources = sorted.ReinterpretCast<int32_t>();
         LocalTensor<int32_t> touched = unionSourceBuf.Get<int32_t>();
         LocalTensor<int32_t> starts = unionSourceBuf.Get<int32_t>()[TOPK];
         LocalTensor<int32_t> ends = unionSourceBuf.Get<int32_t>()[TOPK * 2U];
         // Sort scratch is dead after ExtractIndex; reuse its first tile.
         LocalTensor<int32_t> ageTile = pairOutBuf.Get<int32_t>();
-        const uint32_t touchedCount = LIMAge::BuildSortedHitRuns(
-            sources, TOPK, sourceCapacity, touched, starts, ends);
+        uint32_t touchedCount = 0U;
+        if ((diagnosticFlags_ & LIMAge::SCALAR_HIT_RUNS) != 0U) {
+            touchedCount = LIMAge::BuildSortedHitRuns(
+                sources, TOPK, sourceCapacity, touched, starts, ends);
+        } else {
+            static_assert(4U * TOPK + LIMAge::HIT_RUN_SCRATCH_EXTRA <= CAPACITY * 2U,
+                          "Vector Hit-run scratch must fit pairInBuf");
+            static_assert(TOPK % 64U == 0U, "Vector Hit-run count must align to 64 lanes");
+            uint64_t blockCount = 0U, startCount = 0U, endCount = 0U;
+            // Sorted IDs live in occurrenceBuf; sortInput is now dead scratch.
+            LIMAge::BuildVectorHitRunMetadata(sources, sortInput, touched, starts, ends,
+                                              TOPK, sourceCapacity, blockCount, startCount, endCount);
+            Sync<HardEvent::V_S>(HardEvent::V_S);
+            if (blockCount == 0U || blockCount > TOPK || blockCount != startCount || blockCount != endCount) {
+                // Correctness fallback for an abnormal/unsupported compaction result.
+                touchedCount = LIMAge::BuildSortedHitRuns(
+                    sources, TOPK, sourceCapacity, touched, starts, ends);
+            } else {
+                touchedCount = static_cast<uint32_t>(blockCount);
+            }
+        }
         if ((diagnosticFlags_ & LIMAge::HIT_BUCKETS_ONLY) != 0U) {
             // Keep Source sorting/grouping and its scalar/vector ordering, but
             // perform no age-tile reads, local clears, or age-tile writes.

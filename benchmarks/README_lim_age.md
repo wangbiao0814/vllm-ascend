@@ -96,7 +96,7 @@ representative model throughput.
 The age operator now accepts an optional trailing `diagnostic_flags=0` integer.
 Default zero keeps the full age policy. Bit 1 skips Hit-age clearing, bit 2
 skips scan-time increment, and bit 4 skips Miss-age assignment to P. Values
-0 through 31 are supported. These are low-level experimental operator arguments,
+0 through 127 are supported. These are low-level experimental operator arguments,
 not model additional-config keys. Nonzero values intentionally break age policy
 semantics and must not be used to draw conclusions about production hit rates.
 The score operator is unchanged. Initialization, score protection, sorting, and
@@ -158,7 +158,7 @@ python -m pytest --noconftest -sv \
 ```
 
 CPU workload checks and existing native age arithmetic checks have been run
-locally. The diagnostic NPU tests cover all 32 flag combinations and expected
+locally. The diagnostic NPU tests cover all 128 flag combinations and expected
 age state changes, but CANN compilation and NPU execution remain unverified
 locally. This branch is based on the previously pushed single-query version;
 it does not include unrelated uncommitted multi-query work from another checkout.
@@ -294,3 +294,62 @@ cache identity, including age-only builds, to prevent missing or stale shared
 headers. A CPU CMake test verifies staging through the real source-copy helper.
 This is source dependency staging, not installation of the score operator API;
 a benchmark comparing score and age still requires both APIs installed.
+
+### Sort-only and vector versus scalar run grouping
+
+The default grouping stage now computes block IDs and predecessor/successor
+boundaries with vector operations, then compacts block IDs and start/end offsets.
+The previous per-Source scalar run builder is retained with mask value 64.
+Mask value 32 stops after sorting and extracting Source payloads, before either
+run builder. Existing masks and the V2 argument list are unchanged. Rebuild once
+for the expanded [0,127] flag range and new kernel logic.
+
+```bash
+python -m benchmarks.benchmark_lim_age --scenario all-hit \
+  --ablation hit-group-breakdown --mode eager \
+  --length 16384 --capacity 8192 --steps 32 \
+  --repeats 30 --latency-samples 8 --output lim_hit_group_breakdown.json
+```
+
+This runs score and these age variants, all with increment disabled:
+
+| Age variant | Flags | Work after sorting |
+| --- | --- | --- |
+| `no-increment-or-hit-clear` | 3 | skips sorting and the entire clear stage |
+| `no-increment-hit-sort-only` | 34 | none |
+| `scalar-no-increment-hit-buckets-only` | 74 | scalar run grouping only |
+| `no-increment-hit-buckets-only` | 10 | vector run grouping only |
+| `scalar-no-increment` | 66 | scalar grouping plus DMA and local clearing |
+| `no-increment` | 2 | vector grouping plus DMA and local clearing |
+
+Subtract flags 3 from 34 to estimate sorting/extraction cost. Compare 74 against
+10 to compare grouping implementations, and 66 against 2 to compare complete
+clear paths in the same binary. Final full-normal (`--ablation normal`) timings
+remain necessary. Differences are observational effects, not additive hardware
+instruction costs. Graph event timing remains unsuitable for fine attribution
+until checked against device profiling.
+
+Use `--ablation scalar-hit-runs` (flags 64) for the old grouping algorithm with
+full age semantics and increment enabled; it is also allowed with trace mode.
+Only flags 0/64 represent full age policies. All other named variants disable
+state updates. `policy_valid` reflects this distinction. Flag 1 skips the whole
+clear function; otherwise 32 stops after sort, otherwise 64 selects scalar
+instead of vector grouping, and 8/16 keep their prior stage meanings.
+
+Vector grouping reuses the dead sort-input buffer as scratch (4*2048+320 B32
+words). Masks have separate 256-byte regions, vector operands have aligned starts,
+and prefix/suffix sentinels permit aligned neighbor Gather bases. Invalid IDs
+are excluded before comparing neighbors, including out-of-range IDs in a partial
+last block. Full Source payloads and external TopK order remain unchanged.
+Invalid or inconsistent compaction counts fall back to scalar grouping; profiling
+is needed to confirm the fast path on the target SDK. No persistent state, reverse
+map or additional UB allocation is introduced.
+
+Implementation references: [GatherMask counter mode](https://www.hiascend.com/doc_center/source/en/canncommercial/800/apiref/ascendcopapi/atlasascendc_api_07_0071.html)
+and the repository's existing Compare/GatherMask compaction paths. A CPU semantic
+model executes the actual vector helper and checks every block/start/end against
+the scalar builder across 105 cases. It also checks local operand alignment and
+scratch bounds. It does not model instruction scheduling, target SDK support or
+NPU synchronization. NPU tests cover all 128 flag combinations, invalid masks,
+long Source IDs, partial blocks and graph state updates; these remain unrun
+locally. CANN compilation and hardware speedup require server verification.

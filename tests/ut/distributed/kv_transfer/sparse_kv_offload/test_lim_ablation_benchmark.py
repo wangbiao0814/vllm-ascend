@@ -7,7 +7,14 @@ import io
 import unittest
 from unittest.mock import patch
 
-from benchmarks.benchmark_lim_age import ABLATIONS, HIT_CLEAR_BREAKDOWN, TOPK, parse_args, trace_spec
+from benchmarks.benchmark_lim_age import (
+    ABLATIONS,
+    HIT_CLEAR_BREAKDOWN,
+    HIT_GROUP_BREAKDOWN,
+    TOPK,
+    parse_args,
+    trace_spec,
+)
 
 
 class TestDiagnosticSpec(unittest.TestCase):
@@ -18,6 +25,12 @@ class TestDiagnosticSpec(unittest.TestCase):
         self.assertEqual(ABLATIONS["normal"], 0)
         with patch("sys.argv", ["bench", "--scenario", "all-hit", "--ablation", "hit-clear-breakdown", "--dry-run"]):
             self.assertEqual(parse_args().ablation, "hit-clear-breakdown")
+
+    def test_hit_group_breakdown_keeps_scalar_control_and_sort_only(self):
+        self.assertEqual([ABLATIONS[name] for name in HIT_GROUP_BREAKDOWN], [3, 34, 74, 10, 66, 2])
+        self.assertEqual(ABLATIONS["scalar-hit-runs"], 64)
+        with patch("sys.argv", ["bench", "--scenario", "all-hit", "--ablation", "hit-group-breakdown", "--dry-run"]):
+            self.assertEqual(parse_args().ablation, "hit-group-breakdown")
 
     def test_diagnostic_cli_rejects_invalid_workloads(self):
         for argv in (

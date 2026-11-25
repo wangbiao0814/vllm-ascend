@@ -194,7 +194,7 @@ def test_age_rejects_invalid_contract_and_preserves_invalid_dynamic_row():
     assert torch.equal(ages.cpu(), before_ages)
 
 
-@pytest.mark.parametrize("flags", range(32))
+@pytest.mark.parametrize("flags", range(128))
 @torch.inference_mode()
 def test_age_diagnostic_flags_control_state_updates(flags):
     # Each bit disables only its target stage; the cache plan must remain valid.
@@ -214,7 +214,7 @@ def test_age_diagnostic_flags_control_state_updates(flags):
     hits = sources[initial[row, sources] >= 0]
     misses = sources[initial[row, sources] < 0]
     assert hits.numel() > 0 and misses.numel() > 0
-    if not flags & (1 | 8 | 16):
+    if not flags & (1 | 8 | 16 | 32):
         expected[row, hits] = 0
     if not flags & 4:
         expected[row, misses] = 4
@@ -224,7 +224,7 @@ def test_age_diagnostic_flags_control_state_updates(flags):
     _assert_resident_bijection(cache[row].cpu(), prefix, case.cache_tokens[0])
 
 
-@pytest.mark.parametrize("flags", [-1, 32])
+@pytest.mark.parametrize("flags", [-1, 128])
 @torch.inference_mode()
 def test_age_rejects_invalid_diagnostic_flags(flags):
     case = _build_case(q_values=[1], states=[-1], offload_len=8192, cache_tokens=4096)
@@ -250,3 +250,26 @@ def test_age_buffered_hit_clear_all_hit_partial_block():
     check_age_step(case, cache, ages, outputs, before_cache, before_ages, 4)
     assert int(outputs[2].cpu()[0]) == 0
     assert torch.equal(cache.cpu(), before_cache)
+
+
+@pytest.mark.parametrize("length", [8320, (1 << 17) + BLOCK_SIZE])
+@torch.inference_mode()
+def test_age_vector_and_scalar_grouping_match(length):
+    case = _build_case(q_values=[1], states=[-1], offload_len=length, cache_tokens=4096)
+    results = []
+    for flags in (0, 64):
+        cache = case.cache_seed.clone()
+        ages = torch.arange(cache.shape[1], dtype=torch.int32, device="npu").expand_as(cache).contiguous()
+        outputs = _make_outputs(case)
+        before_cache, before_ages = cache.cpu(), ages.cpu()
+        call_age(case, cache, ages, outputs, 4, diagnostic_flags=flags)
+        check_age_step(case, cache, ages, outputs, before_cache, before_ages, 4)
+        results.append((cache.cpu(), ages.cpu(), [tensor.cpu() for tensor in outputs]))
+    assert torch.equal(results[0][0], results[1][0])
+    assert torch.equal(results[0][1], results[1][1])
+    left, right = results[0][2], results[1][2]
+    for index in (0, 1, 2, 5):
+        assert torch.equal(left[index], right[index])
+    count = int(left[5][0])
+    for index in (3, 4):
+        assert torch.equal(left[index][0, :count], right[index][0, :count])

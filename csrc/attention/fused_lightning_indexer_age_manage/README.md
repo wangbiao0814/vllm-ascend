@@ -94,7 +94,7 @@ No NPU speedup has been verified locally.
 
 For Hit-clear stage diagnostics, mask 8 runs bucket construction only and mask
 16 retains bucket construction plus block DMA but skips local clearing. Flags
-range from 0 through 31; bit 1 (skip entire Hit clear) takes precedence, then bit
+range from 0 through 127; bit 1 (skip entire Hit clear) takes precedence, then bit
 8 (buckets only). Combine either new mode with bit 2 to disable increment. These
 are not valid production age policies. `--ablation hit-clear-breakdown` in the
 benchmark runs the four comparable no-increment variants. The V2 ABI argument
@@ -107,3 +107,11 @@ Existing diagnostic flags retain their meaning, with `buckets` referring to the
 new sorting/grouping stage. The shared original LIM kernel directory is declared
 as a source/cache dependency so changed headers are staged before age compilation.
 NPU correctness and speedup of this update are pending server verification.
+
+Vector run grouping is now the default. Diagnostic mask 32 runs sorting only;
+mask 64 selects the previous scalar run builder without disabling age updates.
+Other skip bits retain their meaning, with range [0,127]. The existing V2 argument
+list is unchanged. Use benchmark `--ablation hit-group-breakdown` for matched
+sort-only, scalar/vector grouping-only and complete-clear comparisons. Masks,
+neighbor Gather and compacted metadata reuse existing UB buffers. Compilation,
+NPU correctness and performance remain to be verified on server.

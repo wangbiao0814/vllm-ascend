@@ -16,6 +16,14 @@ HIT_CLEAR_BREAKDOWN = (
     "no-increment-hit-copy-only",
     "no-increment",
 )
+HIT_GROUP_BREAKDOWN = (
+    "no-increment-or-hit-clear",
+    "no-increment-hit-sort-only",
+    "scalar-no-increment-hit-buckets-only",
+    "no-increment-hit-buckets-only",
+    "scalar-no-increment",
+    "no-increment",
+)
 ABLATIONS = {
     "normal": 0,
     "no-hit-clear": 1,
@@ -27,13 +35,20 @@ ABLATIONS = {
     "hit-copy-only": 16,
     "no-increment-hit-buckets-only": 10,
     "no-increment-hit-copy-only": 18,
+    "hit-sort-only": 32,
+    "no-increment-hit-sort-only": 34,
+    "scalar-hit-runs": 64,
+    "scalar-no-increment": 66,
+    "scalar-no-increment-hit-buckets-only": 74,
 }
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scenario", choices=["trace", "all-hit", "all-miss"], default="trace")
-    parser.add_argument("--ablation", choices=[*ABLATIONS, "all", "hit-clear-breakdown"], default="normal")
+    parser.add_argument(
+        "--ablation", choices=[*ABLATIONS, "all", "hit-clear-breakdown", "hit-group-breakdown"], default="normal"
+    )
     parser.add_argument("--length", type=int, default=16384)
     parser.add_argument("--capacity", type=int, default=8192)
     parser.add_argument("--steps", type=int, default=64)
@@ -52,7 +67,7 @@ def parse_args():
         parser.error("Require 2048 <= capacity <= min(length, 32640)")
     if args.scenario == "all-miss" and args.length < args.capacity + TOPK:
         parser.error("all-miss requires length >= capacity + 2048")
-    if args.ablation != "normal" and args.scenario == "trace":
+    if args.ablation not in ("normal", "scalar-hit-runs") and args.scenario == "trace":
         parser.error("Diagnostic ablations require all-hit or all-miss; they do not preserve the age policy")
     if args.length % 128 or args.capacity % 128:
         parser.error("length and capacity must be 128-aligned")
@@ -139,7 +154,9 @@ def run(args, spec):
     results = []
     selections = {}
     with torch.inference_mode():
-        if args.ablation == "hit-clear-breakdown":
+        if args.ablation == "hit-group-breakdown":
+            names = HIT_GROUP_BREAKDOWN
+        elif args.ablation == "hit-clear-breakdown":
             names = HIT_CLEAR_BREAKDOWN
         else:
             names = ABLATIONS if args.ablation == "all" else [args.ablation]
@@ -243,7 +260,7 @@ def run(args, spec):
                     "policy": policy,
                     "ablation": ablation,
                     "diagnostic_flags": flags,
-                    "policy_valid": flags == 0,
+                    "policy_valid": (flags & ~64) == 0,
                     "hits": accesses - sum(misses),
                     "misses": sum(misses),
                     "accesses": accesses,
