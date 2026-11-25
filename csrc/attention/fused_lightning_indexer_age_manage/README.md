@@ -94,7 +94,7 @@ No NPU speedup has been verified locally.
 
 For Hit-clear stage diagnostics, mask 8 runs bucket construction only and mask
 16 retains bucket construction plus block DMA but skips local clearing. Flags
-range from 0 through 127; bit 1 (skip entire Hit clear) takes precedence, then bit
+range from 0 through 1023; bit 1 (skip entire Hit clear) takes precedence, then bit
 8 (buckets only). Combine either new mode with bit 2 to disable increment. These
 are not valid production age policies. `--ablation hit-clear-breakdown` in the
 benchmark runs the four comparable no-increment variants. The V2 ABI argument
@@ -110,8 +110,18 @@ NPU correctness and speedup of this update are pending server verification.
 
 Vector run grouping is now the default. Diagnostic mask 32 runs sorting only;
 mask 64 selects the previous scalar run builder without disabling age updates.
-Other skip bits retain their meaning, with range [0,127]. The existing V2 argument
+Other skip bits retain their meaning, with range [0,1023]. The existing V2 argument
 list is unchanged. Use benchmark `--ablation hit-group-breakdown` for matched
 sort-only, scalar/vector grouping-only and complete-clear comparisons. Masks,
 neighbor Gather and compacted metadata reuse existing UB buffers. Compilation,
 NPU correctness and performance remain to be verified on server.
+
+Untimed diagnostic mask 128 publishes compaction counts, scalar fallback and
+FinishAge progress into the final 16 unused `miss_dst_slots` cells per request;
+valid Miss entries are unchanged. Default flags zero perform no probe export.
+Mask 512 stops FinishAge after request validation; mask 256 stops after its
+count read. Skip-refill (4) takes precedence, followed by 512, then 256. These
+masks intentionally omit P assignment. The benchmark provides `finish-breakdown`,
+`--diagnostics` and `--profile-dir` to separate checks/count reads, verify fallback
+and collect actual NPU kernel timelines. See the benchmark guide for commands and
+the output-tail layout. Instrumented runs do not report Event latency.

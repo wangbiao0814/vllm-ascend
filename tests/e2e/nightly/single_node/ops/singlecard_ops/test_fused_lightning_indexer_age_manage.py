@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+from benchmarks.benchmark_lim_age import PROBE_WORDS, REPORT_PROBE, decode_probe
 from tests.e2e.nightly.single_node.ops.singlecard_ops.test_fused_lightning_indexer_manage import (
     BLOCK_SIZE,
     MAX_CACHE_TOKENS,
@@ -194,7 +195,7 @@ def test_age_rejects_invalid_contract_and_preserves_invalid_dynamic_row():
     assert torch.equal(ages.cpu(), before_ages)
 
 
-@pytest.mark.parametrize("flags", range(128))
+@pytest.mark.parametrize("flags", [*range(128), 128, 192, 256, 320, 384, 512, 576, 640, 1023])
 @torch.inference_mode()
 def test_age_diagnostic_flags_control_state_updates(flags):
     # Each bit disables only its target stage; the cache plan must remain valid.
@@ -216,7 +217,7 @@ def test_age_diagnostic_flags_control_state_updates(flags):
     assert hits.numel() > 0 and misses.numel() > 0
     if not flags & (1 | 8 | 16 | 32):
         expected[row, hits] = 0
-    if not flags & 4:
+    if not flags & (4 | 256 | 512):
         expected[row, misses] = 4
     assert torch.equal(ages.cpu(), expected)
     assert int(outputs[2].cpu()[0]) == misses.numel()
@@ -224,7 +225,7 @@ def test_age_diagnostic_flags_control_state_updates(flags):
     _assert_resident_bijection(cache[row].cpu(), prefix, case.cache_tokens[0])
 
 
-@pytest.mark.parametrize("flags", [-1, 128])
+@pytest.mark.parametrize("flags", [-1, 1024])
 @torch.inference_mode()
 def test_age_rejects_invalid_diagnostic_flags(flags):
     case = _build_case(q_values=[1], states=[-1], offload_len=8192, cache_tokens=4096)
@@ -273,3 +274,41 @@ def test_age_vector_and_scalar_grouping_match(length):
     count = int(left[5][0])
     for index in (3, 4):
         assert torch.equal(left[index][0, :count], right[index][0, :count])
+
+
+@pytest.mark.parametrize("flags,phase", [(0, 3), (64, 3), (4, 0), (256, 2), (512, 1)])
+@torch.inference_mode()
+def test_age_probe_preserves_valid_outputs_and_reports_stages(flags, phase):
+    case = _build_case(q_values=[1], states=[-1], offload_len=8192, cache_tokens=4096)
+    runs = []
+    for probe_flags in (flags, flags | REPORT_PROBE):
+        cache = case.cache_seed.clone()
+        ages = torch.full_like(cache, 7)
+        outputs = _make_outputs(case)
+        call_age(case, cache, ages, outputs, 4, diagnostic_flags=probe_flags)
+        torch.npu.synchronize()
+        runs.append((cache.cpu(), ages.cpu(), [value.cpu() for value in outputs]))
+    left, right = runs
+    assert torch.equal(left[0], right[0])
+    assert torch.equal(left[1], right[1])
+    for index in (0, 1, 2, 5):
+        assert torch.equal(left[2][index], right[2][index])
+    count = int(right[2][5][0])
+    for index in (3, 4):
+        assert torch.equal(left[2][index][0, :count], right[2][index][0, :count])
+    probe = decode_probe(right[2][4][0, -PROBE_WORDS:].tolist())
+    selected = right[2][0][0, 0].long()
+    initial = case.cache_seed.cpu()[case.req_entries[0]]
+    hits = selected[initial[selected] >= 0]
+    assert hits.numel() > 0 and count > 0
+    assert probe["effective_runs"] == torch.unique(hits // 512).numel()
+    assert probe["finish_phase"] == phase
+    assert probe["finish_count"] == (count if phase >= 2 else -1)
+    if flags & 64:
+        assert probe["path"] == "scalar" and probe["raw_block_count"] == -1
+    elif probe["fallback_count"]:
+        assert probe["path"] == "scalar_fallback"
+    else:
+        assert probe["path"] == "vector"
+        assert probe["raw_block_count"] == probe["raw_start_count"] == probe["raw_end_count"]
+        assert probe["raw_block_count"] == probe["effective_runs"]

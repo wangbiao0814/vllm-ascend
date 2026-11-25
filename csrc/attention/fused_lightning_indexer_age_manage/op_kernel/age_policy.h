@@ -11,7 +11,14 @@ constexpr uint32_t HIT_BUCKETS_ONLY = 8U;
 constexpr uint32_t SKIP_LOCAL_HIT_CLEAR = 16U;
 constexpr uint32_t HIT_SORT_ONLY = 32U;
 constexpr uint32_t SCALAR_HIT_RUNS = 64U;
-constexpr uint32_t DIAGNOSTIC_MASK = 127U;
+constexpr uint32_t REPORT_PROBE = 128U;
+constexpr uint32_t FINISH_COUNT_ONLY = 256U;
+constexpr uint32_t FINISH_CHECK_ONLY = 512U;
+constexpr uint32_t DIAGNOSTIC_MASK = 1023U;
+// Reserved tail cells are written only in untimed diagnostic calls.
+constexpr uint32_t PROBE_WORDS = 16U;
+constexpr int32_t PROBE_MAGIC = 0x4c494d41;
+constexpr int32_t PROBE_VERSION = 1;
 constexpr uint32_t TILE = 512U;
 constexpr uint32_t AGE_INPUT = 13U;
 constexpr uint32_t AGE_OUTPUT = 7U;

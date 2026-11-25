@@ -220,9 +220,13 @@ public:
     __aicore__ inline void Process(uint32_t first, uint32_t stride)
     {
         for (uint32_t batch = first; batch < batchSize; batch += stride) {
+#ifdef LIM_AGE_POLICY
+            if ((diagnosticFlags_ & LIMAge::REPORT_PROBE) != 0U) ResetAgeProbe();
+#endif
             ProcessBatch(batch);
 #ifdef LIM_AGE_POLICY
             FinishAge(batch);
+            if ((diagnosticFlags_ & LIMAge::REPORT_PROBE) != 0U) PublishAgeProbe(batch);
 #endif
         }
     }
@@ -232,6 +236,29 @@ private:
     GlobalTensor<int32_t> agesGm_;
     uint32_t probationAge_ = 0U;
     uint32_t diagnosticFlags_ = 0U;
+    int32_t ageProbe_[LIMAge::PROBE_WORDS];
+    static_assert(MAX_CACHE_TOKENS + LIMAge::PROBE_WORDS <= MISS_CAPACITY,
+                  "Probe tail must not overlap any valid first-fill or Miss plan");
+
+    __aicore__ inline int32_t ProbeCount(uint64_t count) {
+        return count <= static_cast<uint64_t>(INT32_MAX) ? static_cast<int32_t>(count) : INT32_MAX;
+    }
+    __aicore__ inline void ResetAgeProbe() {
+        for (uint32_t i = 0; i < LIMAge::PROBE_WORDS; ++i) ageProbe_[i] = 0;
+        ageProbe_[0] = LIMAge::PROBE_MAGIC;
+        ageProbe_[1] = LIMAge::PROBE_VERSION;
+        ageProbe_[2] = ageProbe_[3] = ageProbe_[4] = -1; // raw compaction counts
+        ageProbe_[8] = -1; // FinishAge count was not read
+    }
+    __aicore__ inline void PublishAgeProbe(uint32_t batch) {
+        LocalTensor<int32_t> local = pairInBuf.Get<int32_t>();
+        for (uint32_t i = 0; i < LIMAge::PROBE_WORDS; ++i) local.SetValue(i, ageProbe_[i]);
+        Sync<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+        const uint64_t offset = static_cast<uint64_t>(batch) * MISS_CAPACITY + MISS_CAPACITY - LIMAge::PROBE_WORDS;
+        DataCopyPad(missDestinationsGm[offset], local,
+                    AscendC::DataCopyExtParams{1, LIMAge::PROBE_WORDS * sizeof(int32_t), 0, 0, 0});
+        Sync<HardEvent::MTE3_S>(HardEvent::MTE3_S);
+    }
 
     __aicore__ inline void WriteAge(uint64_t offset, int32_t value) {
         agesGm_.SetValue(offset, value);
@@ -249,7 +276,10 @@ private:
 
     __aicore__ inline void ClearAgeHits(uint32_t query, uint32_t row) {
         const int32_t misses = LoadAgeCount(routeMissCountsGm, static_cast<uint64_t>(query) * ROUTE_COUNT_STRIDE);
-        if (misses < 0 || misses >= static_cast<int32_t>(TOPK)) return;
+        if (misses < 0 || misses >= static_cast<int32_t>(TOPK)) {
+            if ((diagnosticFlags_ & LIMAge::REPORT_PROBE) != 0U) ageProbe_[7] = 7;
+            return;
+        }
         static_assert(3U * TOPK <= CAPACITY, "Hit run metadata must fit unionSourceBuf");
         static_assert(TOPK <= OCCURRENCE_CAPACITY, "Sorted Hit IDs must fit occurrenceBuf");
         static_assert(TOPK * 2U <= CAPACITY * 2U, "Sort input must fit pairInBuf");
@@ -276,7 +306,10 @@ private:
         LocalTensor<uint32_t> sorted = occurrenceBuf.Get<uint32_t>();
         LIServiceVec::ExtractIndex(sorted, sortInput.ReinterpretCast<uint32_t>(), TOPK);
         Sync<HardEvent::V_S>(HardEvent::V_S);
-        if ((diagnosticFlags_ & LIMAge::HIT_SORT_ONLY) != 0U) return;
+        if ((diagnosticFlags_ & LIMAge::HIT_SORT_ONLY) != 0U) {
+            if ((diagnosticFlags_ & LIMAge::REPORT_PROBE) != 0U) ageProbe_[7] = 1;
+            return;
+        }
         LocalTensor<int32_t> sources = sorted.ReinterpretCast<int32_t>();
         LocalTensor<int32_t> touched = unionSourceBuf.Get<int32_t>();
         LocalTensor<int32_t> starts = unionSourceBuf.Get<int32_t>()[TOPK];
@@ -285,6 +318,7 @@ private:
         LocalTensor<int32_t> ageTile = pairOutBuf.Get<int32_t>();
         uint32_t touchedCount = 0U;
         if ((diagnosticFlags_ & LIMAge::SCALAR_HIT_RUNS) != 0U) {
+            if ((diagnosticFlags_ & LIMAge::REPORT_PROBE) != 0U) ageProbe_[7] = 2;
             touchedCount = LIMAge::BuildSortedHitRuns(
                 sources, TOPK, sourceCapacity, touched, starts, ends);
         } else {
@@ -296,7 +330,17 @@ private:
             LIMAge::BuildVectorHitRunMetadata(sources, sortInput, touched, starts, ends,
                                               TOPK, sourceCapacity, blockCount, startCount, endCount);
             Sync<HardEvent::V_S>(HardEvent::V_S);
+            if ((diagnosticFlags_ & LIMAge::REPORT_PROBE) != 0U) {
+                ageProbe_[2] = ProbeCount(blockCount);
+                ageProbe_[3] = ProbeCount(startCount);
+                ageProbe_[4] = ProbeCount(endCount);
+                ageProbe_[7] = 3;
+            }
             if (blockCount == 0U || blockCount > TOPK || blockCount != startCount || blockCount != endCount) {
+                if ((diagnosticFlags_ & LIMAge::REPORT_PROBE) != 0U) {
+                    ageProbe_[5] = 1;
+                    ageProbe_[7] = 4;
+                }
                 // Correctness fallback for an abnormal/unsupported compaction result.
                 touchedCount = LIMAge::BuildSortedHitRuns(
                     sources, TOPK, sourceCapacity, touched, starts, ends);
@@ -304,6 +348,7 @@ private:
                 touchedCount = static_cast<uint32_t>(blockCount);
             }
         }
+        if ((diagnosticFlags_ & LIMAge::REPORT_PROBE) != 0U) ageProbe_[6] = static_cast<int32_t>(touchedCount);
         if ((diagnosticFlags_ & LIMAge::HIT_BUCKETS_ONLY) != 0U) {
             // Keep Source sorting/grouping and its scalar/vector ordering, but
             // perform no age-tile reads, local clears, or age-tile writes.
@@ -339,8 +384,16 @@ private:
         const uint32_t begin = batch == 0 ? 0 : actualSeqLengthsQueryGm.GetValue(batch - 1);
         int32_t row; uint32_t length, cache;
         if (end != batch + 1U || end != begin + 1U || !ValidateOffloadRequest(batch, begin, end, row, length, cache)) return;
+        if ((diagnosticFlags_ & LIMAge::REPORT_PROBE) != 0U) ageProbe_[9] = 1;
+        if ((diagnosticFlags_ & LIMAge::FINISH_CHECK_ONLY) != 0U) return;
         const int32_t count = LoadAgeCount(countsGm, batch);
+        if ((diagnosticFlags_ & LIMAge::REPORT_PROBE) != 0U) {
+            ageProbe_[8] = count;
+            ageProbe_[9] = 2;
+        }
+        if ((diagnosticFlags_ & LIMAge::FINISH_COUNT_ONLY) != 0U) return;
         if (count <= 0 || count > static_cast<int32_t>(MISS_CAPACITY)) return;
+        if ((diagnosticFlags_ & LIMAge::REPORT_PROBE) != 0U) ageProbe_[9] = 3;
         LocalTensor<int32_t> sources = pairInBuf.Get<float>().ReinterpretCast<int32_t>();
         for (uint32_t start = 0; start < static_cast<uint32_t>(count); start += EVICT_CHUNK) {
             const uint32_t n = LICommon::Min(EVICT_CHUNK, static_cast<uint32_t>(count) - start);

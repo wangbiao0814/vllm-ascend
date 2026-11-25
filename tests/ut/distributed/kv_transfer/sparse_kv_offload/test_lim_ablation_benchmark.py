@@ -9,9 +9,12 @@ from unittest.mock import patch
 
 from benchmarks.benchmark_lim_age import (
     ABLATIONS,
+    FINISH_BREAKDOWN,
     HIT_CLEAR_BREAKDOWN,
     HIT_GROUP_BREAKDOWN,
+    PROBE_MAGIC,
     TOPK,
+    decode_probe,
     parse_args,
     trace_spec,
 )
@@ -43,6 +46,46 @@ class TestDiagnosticSpec(unittest.TestCase):
                 self.assertEqual(error.exception.code, 2)
         with patch("sys.argv", ["bench", "--scenario", "all-hit", "--ablation", "all", "--dry-run"]):
             self.assertEqual(parse_args().ablation, "all")
+
+    def test_finish_breakdown_and_instrumentation_cli(self):
+        self.assertEqual([ABLATIONS[name] for name in FINISH_BREAKDOWN], [0, 4, 512, 256, 64, 68, 576, 320])
+        argv = [
+            "bench",
+            "--scenario",
+            "all-hit",
+            "--ablation",
+            "finish-breakdown",
+            "--diagnostics",
+            "--profile-dir",
+            "/tmp/lim-profile",
+            "--probe-calls",
+            "2",
+            "--profile-calls",
+            "4",
+        ]
+        with patch("sys.argv", argv):
+            args = parse_args()
+        self.assertTrue(args.diagnostics)
+        self.assertEqual(str(args.profile_dir), "/tmp/lim-profile")
+        self.assertEqual((args.probe_calls, args.profile_calls), (2, 4))
+        for option in ("--probe-calls", "--profile-calls"):
+            with (
+                patch("sys.argv", ["bench", option, "0"]),
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                parse_args()
+
+    def test_probe_decoder_handles_fallback_and_unread_count(self):
+        words = [PROBE_MAGIC, 1, 4, 0, 4, 1, 4, 4, -1, 1] + [0] * 6
+        probe = decode_probe(words)
+        self.assertEqual(probe["path"], "scalar_fallback")
+        self.assertEqual(probe["fallback_count"], 1)
+        self.assertEqual(probe["raw_start_count"], 0)
+        self.assertEqual((probe["finish_count"], probe["finish_phase"]), (-1, 1))
+        for invalid in ([0] * 16, words[:-1], [PROBE_MAGIC, 2] + words[2:]):
+            with self.assertRaisesRegex(RuntimeError, "rebuild"):
+                decode_probe(invalid)
 
     def test_all_hit_and_all_miss_residency(self):
         for capacity in (TOPK, 8192):
