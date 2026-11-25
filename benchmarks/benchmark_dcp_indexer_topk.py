@@ -6,7 +6,7 @@ import argparse
 import json
 import math
 import os
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from functools import wraps
 from pathlib import Path
 from time import perf_counter_ns
@@ -30,6 +30,7 @@ def parse_args():
     parser.add_argument("--interleave", type=int, default=DEFAULT_INTERLEAVE, help="Global tokens per DCP stripe")
     parser.add_argument("--input", choices=["qli", "synthetic"], default="qli", help="Run QLI or preload candidates")
     parser.add_argument("--id-mode", choices=["owner-local", "global", "both"], default="both")
+    parser.add_argument("--mode", choices=["eager", "graph", "both"], default="eager", help="Execution mode")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--seed", type=int, default=7)
@@ -185,15 +186,45 @@ def profile_stages(group):
         yield
 
 
+def warmup_case(invoke, steps):
+    import torch
+
+    with torch.inference_mode():
+        for _ in range(steps):
+            invoke()
+        torch.npu.synchronize()
+
+
+def capture_graph(invoke, group, warmup_steps):
+    import torch
+    import torch.distributed as dist
+
+    # Initialize the same Triton variants and HCCL collective before capture.
+    warmup_case(invoke, warmup_steps)
+    dist.barrier(group=group.cpu_group)
+    graph = torch.npu.NPUGraph()
+    # NPUCommunicator uses ProcessGroupHCCL here, as in eager. torch.npu.graph
+    # captures its stream work without vLLM's CUDA communicator context.
+    with torch.inference_mode(), torch.npu.graph(graph):
+        output = invoke()
+    return graph, output
+
+
+def verify_output(matches, group, case):
+    import torch
+    import torch.distributed as dist
+
+    verified = torch.tensor(int(matches), dtype=torch.int32)
+    dist.all_reduce(verified, op=dist.ReduceOp.MIN, group=group.cpu_group)
+    if not verified.item():
+        raise RuntimeError(f"Top-K output mismatch for {case}, rank={group.rank_in_group}, local_match={matches}")
+
+
 def time_case(invoke, group, args):
     import torch
     import torch.distributed as dist
 
-    with torch.inference_mode():
-        for _ in range(args.warmup):
-            invoke()
-        torch.npu.synchronize()
-
+    warmup_case(invoke, args.warmup)
     samples = []
     for _ in range(args.iterations):
         dist.barrier(group=group.cpu_group)
@@ -213,7 +244,7 @@ def time_case(invoke, group, args):
     }
 
 
-def trace_case(select, candidates, exchange, group, args, directory):
+def trace_case(select, candidates, exchange, group, args, directory, *, replay=None):
     import torch
     import torch.distributed as dist
     import torch_npu
@@ -222,7 +253,7 @@ def trace_case(select, candidates, exchange, group, args, directory):
     dist.barrier(group=group.cpu_group)
     with (
         torch.inference_mode(),
-        profile_stages(group),
+        profile_stages(group) if replay is None else nullcontext(),
         profiler.profile(
             activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.NPU],
             experimental_config=profiler._ExperimentalConfig(profiler_level=profiler.ProfilerLevel.Level1),
@@ -230,11 +261,15 @@ def trace_case(select, candidates, exchange, group, args, directory):
         ) as trace,
     ):
         for _ in range(args.profile_steps):
-            with torch.profiler.record_function("dcp_indexer.step"):
-                if select is not None:
-                    with torch.profiler.record_function("dcp_indexer.local_qli"):
-                        candidates = select()
-                exchange(candidates)
+            if replay is not None:
+                with torch.profiler.record_function("dcp_indexer.graph_replay"):
+                    replay()
+            else:
+                with torch.profiler.record_function("dcp_indexer.step"):
+                    if select is not None:
+                        with torch.profiler.record_function("dcp_indexer.local_qli"):
+                            candidates = select()
+                    exchange(candidates)
             trace.step()
         torch.npu.synchronize()
     dist.barrier(group=group.cpu_group)
@@ -242,7 +277,6 @@ def trace_case(select, candidates, exchange, group, args, directory):
 
 def run_cases(args, group, device, device_operator):
     import torch
-    import torch.distributed as dist
 
     from vllm_ascend.attention.context_parallel.sharded_indexer import (
         PACKED_PAIR_BYTES,
@@ -271,48 +305,62 @@ def run_cases(args, group, device, device_operator):
                     pair = select() if select is not None else candidates
                     return exchange(pair)
 
-                actual = exchange(candidates).cpu()[sample, 0]
-                verified = torch.tensor(int(torch.equal(actual, expected[mode])), dtype=torch.int32)
-                dist.all_reduce(verified, op=dist.ReduceOp.MIN, group=group.cpu_group)
-                if not verified.item():
-                    raise RuntimeError(f"Top-K reference mismatch for Q={rows}, KV={length}, mode={mode}, rank={rank}")
-
-                latency = time_case(invoke, group, args)
-                tile = gathered_candidate_row_tile(rows, WORLD_SIZE, TOPK)
                 case = f"{args.input}-{mode}-q{rows}-kv{length}"
-                directory = args.profile_dir / case if args.profile_dir is not None else None
-                if directory is not None:
-                    trace_case(select, candidates, exchange, group, args, directory)
-                if rank == 0:
-                    print(
-                        json.dumps(
-                            {
-                                "case": case,
-                                "input": args.input,
-                                "id_mode": mode,
-                                "queries": rows,
-                                "queries_per_request": args.queries_per_request,
-                                "global_context": length,
-                                "local_context_by_rank": [
-                                    local_length(length, r, args.interleave) for r in range(WORLD_SIZE)
-                                ],
-                                "replicated_heads": args.heads,
-                                "kernel_page_size": PAGE_SIZE,
-                                "interleave": args.interleave,
-                                "topk": TOPK,
-                                "world_size": WORLD_SIZE,
-                                "seed": args.seed,
-                                "warmup_steps": args.warmup,
-                                "all_gathers_per_step": math.ceil(rows / tile),
-                                "packed_input_bytes_per_rank": rows * TOPK * PACKED_PAIR_BYTES,
-                                "checked_rows": sample,
-                                "trace_dir": str(directory) if directory is not None else None,
-                                **latency,
-                            }
-                        ),
-                        flush=True,
-                    )
-                del invoke
+                eager_output = exchange(candidates).cpu()
+                verify_output(torch.equal(eager_output[sample, 0], expected[mode]), group, case + " CPU reference")
+
+                measurements = []
+                if args.mode in ("eager", "both"):
+                    measurements.append(("eager", None, time_case(invoke, group, args)))
+                if args.mode in ("graph", "both"):
+                    graph, graph_output = capture_graph(invoke, group, args.warmup)
+                    # Poison the graph-owned output outside capture to check that
+                    # replay writes it rather than reading a stale capture result.
+                    with torch.inference_mode():
+                        graph_output.fill_(torch.iinfo(graph_output.dtype).min)
+                        graph.replay()
+                    verify_output(torch.equal(graph_output.cpu(), eager_output), group, case + " graph replay")
+                    measurements.append(("graph", graph.replay, time_case(graph.replay, group, args)))
+
+                tile = gathered_candidate_row_tile(rows, WORLD_SIZE, TOPK)
+                for execution_mode, replay, latency in measurements:
+                    label = case if execution_mode == "eager" else case + "-graph"
+                    directory = args.profile_dir / label if args.profile_dir is not None else None
+                    if directory is not None:
+                        trace_case(select, candidates, exchange, group, args, directory, replay=replay)
+                    if rank == 0:
+                        print(
+                            json.dumps(
+                                {
+                                    "case": label,
+                                    "execution_mode": execution_mode,
+                                    "input": args.input,
+                                    "id_mode": mode,
+                                    "queries": rows,
+                                    "queries_per_request": args.queries_per_request,
+                                    "global_context": length,
+                                    "local_context_by_rank": [
+                                        local_length(length, r, args.interleave) for r in range(WORLD_SIZE)
+                                    ],
+                                    "replicated_heads": args.heads,
+                                    "kernel_page_size": PAGE_SIZE,
+                                    "interleave": args.interleave,
+                                    "topk": TOPK,
+                                    "world_size": WORLD_SIZE,
+                                    "seed": args.seed,
+                                    "warmup_steps": args.warmup,
+                                    "all_gathers_per_step": math.ceil(rows / tile),
+                                    "packed_input_bytes_per_rank": rows * TOPK * PACKED_PAIR_BYTES,
+                                    "checked_rows": sample,
+                                    "trace_dir": str(directory) if directory is not None else None,
+                                    **latency,
+                                }
+                            ),
+                            flush=True,
+                        )
+                if args.mode in ("graph", "both"):
+                    del graph, graph_output, replay
+                del measurements, invoke
             del select, candidates
 
 

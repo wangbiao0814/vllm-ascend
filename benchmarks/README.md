@@ -269,10 +269,14 @@ contains this rank's globally selected winners, compacted and padded with
 `-1`. Global output contains the same globally ordered Top-K on every rank,
 with the coordinate system relevant to sparse KV offload.
 
-The benchmark times eager candidate selection and exchange. It prepares
-QLI metadata once per case and keeps tensor creation and validation outside
-the measured steps. Model projections, quantization, cache writes, main
-attention, KV offload I/O, and ACL graph replay are outside its scope.
+The benchmark times eager candidate selection and exchange by default.
+`--mode graph` captures and replays the same path using ACL Graph, and
+`--mode both` measures eager and replay on the same fixed inputs. It
+prepares QLI metadata once per case and keeps input creation, validation,
+warmup, and graph capture outside the measured steps. The graph includes
+the real HCCL collective through the same vLLM DCP group. Model projections,
+quantization, cache writes, main attention, and KV offload I/O are outside
+its scope.
 
 ### Run on the server
 
@@ -302,7 +306,21 @@ torchrun --standalone --nproc-per-node=16 benchmarks/benchmark_dcp_indexer_topk.
 torchrun --standalone --nproc-per-node=16 benchmarks/benchmark_dcp_indexer_topk.py \
   --queries 12 --context-lengths 131072 --id-mode both \
   --profile-dir /tmp/dcp-indexer-traces --profile-steps 3
+
+# Compare unprofiled eager and ACL Graph timing on identical inputs.
+torchrun --standalone --nproc-per-node=16 benchmarks/benchmark_dcp_indexer_topk.py \
+  --mode both --queries 12 --context-lengths 131072 --id-mode both
+
+# Trace a single warmed ACL Graph replay of the global-ID path.
+torchrun --standalone --nproc-per-node=16 benchmarks/benchmark_dcp_indexer_topk.py \
+  --mode graph --queries 12 --context-lengths 131072 --id-mode global \
+  --profile-dir /tmp/dcp-indexer-graph-traces --profile-steps 1
 ```
+
+Graph mode also accepts `--input synthetic` to capture only the candidate
+exchange. All ranks capture and replay the same shape and collective sequence.
+Graph mode requires a CANN and torch_npu stack that supports HCCL capture for
+the chosen configuration. A capture or replay failure terminates the run.
 
 `--queries` and `--context-lengths` form a Cartesian sweep. Context length
 counts global tokens per request, including the current query suffix. Each
@@ -312,7 +330,8 @@ each. K history storage grows with request count and context length.
 
 ### Read the results
 
-Rank 0 prints one JSON line per case and ID mode. It includes local contexts
+Rank 0 prints one JSON line per case, ID mode, and `execution_mode`. Graph
+case names and trace directories end in `-graph`. Each line includes local contexts
 for all ranks, the number of collectives per step, and the packed input
 bytes per rank (INT32 ID plus FP32 score bits for each candidate). The byte
 count is the logical input size. Each sample is the maximum across ranks
@@ -324,12 +343,17 @@ boundary if present, for valid local IDs, causal bounds, candidate counts,
 and padding. It compares each rank's output against a CPU sort of all
 ranks' candidate scores and IDs. The CPU check verifies candidate validity
 and exchange semantics using QLI's returned scores.
+In graph mode, replay must also overwrite the output buffer and match the
+full eager output on every rank, including rows outside the CPU sample.
 
 In each trace case directory, open the rank-specific Ascend profiler output
 in MindStudio Insight or load its trace timeline in a compatible viewer.
-Find `dcp_indexer.step`, `dcp_indexer.local_qli` (native QLI dispatch and
+For eager, find `dcp_indexer.step`, `dcp_indexer.local_qli` (native QLI dispatch and
 nested `dcp_indexer.normalize`), `dcp_indexer.sort_pack`,
 `dcp_indexer.all_gather`, and `dcp_indexer.merge`. Sort and pack share a
 scope because production can fuse them. Use the NPU and HCCL lanes for
-device durations and the CPU scopes to correlate dispatch. The optional
-trace runs after the timing samples for that case.
+device durations and the CPU scopes to correlate dispatch. Graph profiling
+records `dcp_indexer.graph_replay` on the host. Visibility of individual
+device and HCCL tasks depends on the profiler and CANN versions. In
+`--mode both`, timing for both execution modes of an ID case runs before
+either trace. Use the unprofiled JSON samples for the latency comparison.
