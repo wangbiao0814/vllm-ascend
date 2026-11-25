@@ -373,6 +373,9 @@ def main():
                 for name in ("npu_quant_lightning_indexer_v2", "npu_quant_lightning_indexer_v2_metadata")
             ):
                 raise RuntimeError("Build and install the vLLM Ascend A3 QLI and QLI metadata custom operators.")
+            # Initialize ops first: its eager imports reach DeviceOperator,
+            # which itself imports Triton modules from the ops package.
+            import vllm_ascend.ops  # noqa: F401
             from vllm_ascend.device.device_op import DeviceOperator
 
             device_operator = DeviceOperator
