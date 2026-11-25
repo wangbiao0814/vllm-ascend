@@ -40,7 +40,10 @@ __aicore__ inline void BuildVectorHitRunMetadata(
     Cast(neighbor, sources, RoundMode::CAST_NONE, count);
     PipeBarrier<PIPE_V>();
     CompareScalar(valid, neighbor, 0.0F, CMPMODE::GE, count);
-    CompareScalar(upper, neighbor, static_cast<float>(capacity), CMPMODE::LT, count);
+    // AI Core forbids direct scalar unsigned-to-float casts. The validated
+    // Source capacity is <= 2^21, so the signed intermediate is exact and safe.
+    const int32_t signedCapacity = static_cast<int32_t>(capacity);
+    CompareScalar(upper, neighbor, static_cast<float>(signedCapacity), CMPMODE::LT, count);
     PipeBarrier<PIPE_V>();
     And(valid.ReinterpretCast<uint16_t>(), valid.ReinterpretCast<uint16_t>(),
         upper.ReinterpretCast<uint16_t>(), count / HIT_RUN_MASK_BITS_PER_HALFWORD);
