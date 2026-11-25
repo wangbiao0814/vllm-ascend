@@ -99,3 +99,11 @@ range from 0 through 31; bit 1 (skip entire Hit clear) takes precedence, then bi
 are not valid production age policies. `--ablation hit-clear-breakdown` in the
 benchmark runs the four comparable no-increment variants. The V2 ABI argument
 list is unchanged; rebuilding is required for flag validation and kernel logic.
+
+Hit grouping now uses vector Source sorting followed by contiguous block runs,
+replacing scalar head/next list construction and pointer chasing. Miss-prefix
+entries are masked in a local copy; external TopK order and outputs are unchanged.
+Existing diagnostic flags retain their meaning, with `buckets` referring to the
+new sorting/grouping stage. The shared original LIM kernel directory is declared
+as a source/cache dependency so changed headers are staged before age compilation.
+NPU correctness and speedup of this update are pending server verification.

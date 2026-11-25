@@ -38,6 +38,43 @@ LIM_AGE_INLINE void ClearHitBlock(int32_t node, Sources &sources,
         node = next.GetValue(position);
     }
 }
+// Input must be descending by full Source ID, with masked Misses/padding -1.
+// Record boundaries only when the block changes, not once per Hit.
+template <typename Sources, typename Blocks, typename Starts, typename Ends>
+LIM_AGE_INLINE uint32_t BuildSortedHitRuns(Sources &sources, uint32_t count,
+                                          uint32_t capacity, Blocks &blocks,
+                                          Starts &starts, Ends &ends)
+{
+    uint32_t runs = 0U;
+    uint32_t previous = UINT32_MAX;
+    uint32_t end = 0U;
+    for (uint32_t i = 0U; i < count; ++i) {
+        const int32_t source = sources.GetValue(i);
+        if (source < 0) break;
+        if (static_cast<uint32_t>(source) >= capacity) continue;
+        const uint32_t block = static_cast<uint32_t>(source) / HIT_BLOCK_SIZE;
+        if (block != previous) {
+            if (runs != 0U) ends.SetValue(runs - 1U, static_cast<int32_t>(end));
+            blocks.SetValue(runs, static_cast<int32_t>(block));
+            starts.SetValue(runs, static_cast<int32_t>(i));
+            previous = block;
+            ++runs;
+        }
+        end = i + 1U;
+    }
+    if (runs != 0U) ends.SetValue(runs - 1U, static_cast<int32_t>(end));
+    return runs;
+}
+
+template <typename Sources, typename Ages>
+LIM_AGE_INLINE void ClearSortedHitRun(uint32_t begin, uint32_t end,
+                                     Sources &sources, Ages &ages)
+{
+    for (uint32_t i = begin; i < end; ++i) {
+        const uint32_t offset = static_cast<uint32_t>(sources.GetValue(i)) % HIT_BLOCK_SIZE;
+        ages.SetValue(offset, 0);
+    }
+}
 #undef LIM_AGE_INLINE
 } // namespace LIMAge
 #endif

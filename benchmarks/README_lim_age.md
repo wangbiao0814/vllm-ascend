@@ -258,3 +258,39 @@ Use `--ablation hit-buckets-only` or `--ablation hit-copy-only` to retain increm
 while testing either new mode. `--ablation all` includes both new modes and their
 no-increment combinations. JSON rows record the exact flags. Existing flag
 values 0 through 7 and the V2 ACLNN parameter order are unchanged.
+
+### Sorted Source runs instead of scalar linked lists
+
+The latest Hit-clear implementation uses the existing AscendC `SortAll` path
+on 2048 float Source keys and full uint32 Source payloads. The Miss prefix is
+masked to -1 in the local copy before sorting; public TopK outputs are untouched.
+Sources up to the supported 2^21 capacity are exactly representable as float
+keys, and payload extraction retains the full Source ID without score tag bits.
+
+One linear scan records boundaries of consecutive 512-source blocks. Metadata
+is written only on a block transition, replacing per-Hit head/next writes. Local
+clearing walks contiguous sorted IDs and no longer loads a `next` pointer for
+each Hit. Age blocks still use one DMA read and one DMA write each. Existing UB
+buffers are reused, with no persistent state, reverse map or ABI change.
+
+Historical benchmark labels containing `buckets` are retained for compatibility,
+but their grouping stage now measures vector sorting plus run construction.
+Flags 8/10 stop after this stage; 16/18 include DMA but skip the linear local
+clear. Run the same `hit-clear-breakdown` command and compare against the previous
+binary under identical eager settings. Compare full-normal latency as well;
+a smaller stage difference alone does not establish an overall improvement.
+
+A fixed 2048-element sort is performed for every nonempty Hit set. This targets
+the measured high-Hit case and may cost more for a very small Hit set; all-Miss
+still returns before sorting. Sorting performance, compiler behavior and NPU
+correctness need hardware validation. CPU tests exercise the actual run/clear
+helpers against an elementwise oracle, including long IDs, duplicate Hits,
+invalid IDs, Miss-prefix exclusion, partial blocks and maximum Source capacity;
+they substitute `std::sort` for the device sort and cannot verify that SDK stage.
+
+The age CMake definition now also declares the original LIM directory as a
+shared kernel dependency. Its headers are staged and included in prepared-input
+cache identity, including age-only builds, to prevent missing or stale shared
+headers. A CPU CMake test verifies staging through the real source-copy helper.
+This is source dependency staging, not installation of the score operator API;
+a benchmark comparing score and age still requires both APIs installed.

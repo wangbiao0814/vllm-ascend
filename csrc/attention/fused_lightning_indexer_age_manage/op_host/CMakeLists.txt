@@ -1,3 +1,8 @@
+# The age kernel includes the production LIM headers. Stage those headers and
+# include them in the prepared-input cache key even for an age-only build.
+set(fused_lightning_indexer_age_manage_depends attention/fused_lightning_indexer_manage
+    CACHE INTERNAL "Shared kernel inputs for age LIM")
+
 add_op_to_compiled_list()
 
 if (BUILD_OPEN_PROJECT)

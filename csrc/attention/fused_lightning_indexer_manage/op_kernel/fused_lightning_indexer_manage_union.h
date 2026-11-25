@@ -250,34 +250,42 @@ private:
     __aicore__ inline void ClearAgeHits(uint32_t query, uint32_t row) {
         const int32_t misses = LoadAgeCount(routeMissCountsGm, static_cast<uint64_t>(query) * ROUTE_COUNT_STRIDE);
         if (misses < 0 || misses >= static_cast<int32_t>(TOPK)) return;
-        constexpr uint32_t MAX_HIT_BLOCKS =
-            (LIMConfig::MAX_SOURCE_CAPACITY + LIMAge::HIT_BLOCK_SIZE - 1U) / LIMAge::HIT_BLOCK_SIZE;
-        static_assert(MAX_HIT_BLOCKS <= CAPACITY, "Hit bucket heads must fit unionSourceBuf");
-        static_assert(TOPK <= OCCURRENCE_CAPACITY, "Hit links must fit occurrenceBuf");
-        static_assert(TOPK + LIMAge::HIT_BLOCK_SIZE <= CAPACITY * 2U,
-                      "Touched blocks and age tile must fit pairOutBuf");
-        // All four union buffers are idle before ProcessGeneralizedSteady.
-        // Reuse them without increasing persistent state or the UB allocation.
-        LocalTensor<int32_t> sources = pairInBuf.Get<int32_t>();
-        LocalTensor<int32_t> heads = unionSourceBuf.Get<int32_t>();
-        LocalTensor<int32_t> next = occurrenceBuf.Get<int32_t>();
-        LocalTensor<int32_t> touched = pairOutBuf.Get<int32_t>();
-        LocalTensor<int32_t> ageTile = pairOutBuf.Get<int32_t>()[TOPK];
-        const uint32_t blocks =
-            (sourceCapacity + LIMAge::HIT_BLOCK_SIZE - 1U) / LIMAge::HIT_BLOCK_SIZE;
-        Duplicate(heads, -1, blocks);
-        DataCopyPad(sources, topkSourcesGm[static_cast<uint64_t>(query) * TOPK],
+        static_assert(3U * TOPK <= CAPACITY, "Hit run metadata must fit unionSourceBuf");
+        static_assert(TOPK <= OCCURRENCE_CAPACITY, "Sorted Hit IDs must fit occurrenceBuf");
+        static_assert(TOPK * 2U <= CAPACITY * 2U, "Sort input must fit pairInBuf");
+        // SortAll consumes [float keys, uint32 payloads] and returns interleaved
+        // pairs in its first argument. Source IDs <= 2^21 are exact float keys;
+        // carry full IDs as payloads, without the attention score/tag codec.
+        LocalTensor<float> sortInput = pairInBuf.Get<float>();
+        LocalTensor<float> sortScratch = pairOutBuf.Get<float>();
+        LocalTensor<int32_t> payload = sortInput[TOPK].ReinterpretCast<int32_t>();
+        DataCopyPad(payload, topkSourcesGm[static_cast<uint64_t>(query) * TOPK],
                     AscendC::DataCopyExtParams{1, TOPK * sizeof(int32_t), 0, 0, 0},
                     AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
-        Sync<HardEvent::V_S>(HardEvent::V_S);
-        Sync<HardEvent::MTE2_S>(HardEvent::MTE2_S);
-        uint32_t touchedCount = 0U;
-        for (uint32_t i = static_cast<uint32_t>(misses); i < TOPK; ++i) {
-            LIMAge::AppendHitBlock(sources.GetValue(i), i, sourceCapacity,
-                                   heads, next, touched, touchedCount);
+        Sync<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+        // Mask the Miss prefix in payloads as well as keys so no tie with
+        // negative padding can ever turn a Miss into a cleared Hit.
+        if (misses != 0) {
+            Duplicate(payload, -1, static_cast<uint32_t>(misses));
+            PipeBarrier<PIPE_V>();
         }
+        Cast(sortInput, payload, RoundMode::CAST_NONE, TOPK);
+        PipeBarrier<PIPE_V>();
+        LIServiceVec::SortAll(sortInput, sortScratch, TOPK);
+        PipeBarrier<PIPE_V>();
+        LocalTensor<uint32_t> sorted = occurrenceBuf.Get<uint32_t>();
+        LIServiceVec::ExtractIndex(sorted, sortInput.ReinterpretCast<uint32_t>(), TOPK);
+        Sync<HardEvent::V_S>(HardEvent::V_S);
+        LocalTensor<int32_t> sources = sorted.ReinterpretCast<int32_t>();
+        LocalTensor<int32_t> touched = unionSourceBuf.Get<int32_t>();
+        LocalTensor<int32_t> starts = unionSourceBuf.Get<int32_t>()[TOPK];
+        LocalTensor<int32_t> ends = unionSourceBuf.Get<int32_t>()[TOPK * 2U];
+        // Sort scratch is dead after ExtractIndex; reuse its first tile.
+        LocalTensor<int32_t> ageTile = pairOutBuf.Get<int32_t>();
+        const uint32_t touchedCount = LIMAge::BuildSortedHitRuns(
+            sources, TOPK, sourceCapacity, touched, starts, ends);
         if ((diagnosticFlags_ & LIMAge::HIT_BUCKETS_ONLY) != 0U) {
-            // Keep bucket construction and its scalar/vector ordering, but
+            // Keep Source sorting/grouping and its scalar/vector ordering, but
             // perform no age-tile reads, local clears, or age-tile writes.
             Sync<HardEvent::S_V>(HardEvent::S_V);
             return;
@@ -292,7 +300,8 @@ private:
                         AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
             Sync<HardEvent::MTE2_S>(HardEvent::MTE2_S);
             if ((diagnosticFlags_ & LIMAge::SKIP_LOCAL_HIT_CLEAR) == 0U)
-                LIMAge::ClearHitBlock(heads.GetValue(block), sources, next, ageTile);
+                LIMAge::ClearSortedHitRun(static_cast<uint32_t>(starts.GetValue(i)),
+                                          static_cast<uint32_t>(ends.GetValue(i)), sources, ageTile);
             Sync<HardEvent::S_MTE3>(HardEvent::S_MTE3);
             DataCopyPad(agesGm_[base + start], ageTile, copy);
             // Complete DMA before the next tile reuses ageTile and before
