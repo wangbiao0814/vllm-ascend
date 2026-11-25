@@ -6,6 +6,7 @@
 #include "kernel_operator.h"
 #define LIM_AGE_POLICY 1
 #include "age_policy.h"
+#include "age_hit_blocks.h"
 using FusedLightningIndexerManageTilingData = FusedLightningIndexerAgeManageTilingData;
 #include "../../fused_lightning_indexer_manage/op_kernel/fused_lightning_indexer_manage_template_tiling_key.h"
 #include "../../fused_lightning_indexer_manage/op_kernel/fused_lightning_indexer_manage_constants.h"

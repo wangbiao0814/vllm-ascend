@@ -190,3 +190,31 @@ fails, inspect the loaded vendor-library paths for an older installation.
 The CPU tests validate generation dependencies, forwarding argument positions,
 legacy flags-zero forwarding, and compile-time rejection of a stale header;
 they do not replace CANN compilation or NPU runtime validation.
+
+### Buffered Hit clear
+
+The latest normal age path groups Hit Source IDs into temporary 512-source
+buckets in existing UB buffers. Each touched age block is loaded once, its Hit
+positions are set to zero in UB, and the block is written back once by DMA.
+Untouched blocks are not copied by this stage. Hit clear no longer performs one
+GM scalar write/cache-line flush per Hit; Miss assignment still uses the original
+path. Increment, candidate selection, sorting, initialization and diagnostic flag
+meanings are unchanged. No persistent state or Slot-to-Source reverse map is added.
+
+Bucket construction and local clearing still use scalar UB operations in this
+first implementation. It is not a hardware Scatter implementation. The existing
+buffers provide 4096 bucket heads for the maximum 2^21-source capacity and 2048
+linked-list nodes. Work is proportional to the number of heads initialized,
+Hits and touched blocks, rather than scanning all Hits separately for every block.
+At 16384-source capacity, at most 32 blocks are touched. For very long histories
+with scattered Hits, additional block DMA can be substantial; speedup is not
+established until NPU measurements are available.
+
+Rebuild the extension and run the same all-hit benchmark. Compare normal age
+against `no-hit-clear` in the new binary, and compare normal against the previous
+binary with identical parameters. All-hit must still report zero Misses and
+unchanged mappings. Existing graph, mixed Hit/Miss, diagnostic-flag and long-Source
+tests remain applicable; a new partial-block all-hit NPU regression checks the
+last block and preservation of non-Hit ages. The native CPU regression exercises
+the shared bucket/clear helpers with invalid IDs, repeated Hits, Miss-prefix
+exclusion, empty Hit sets, partial tails, and the maximum Source capacity.

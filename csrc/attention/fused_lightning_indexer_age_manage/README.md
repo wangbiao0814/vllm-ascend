@@ -85,3 +85,9 @@ inference or hit-rate quality comparisons. Rebuild the extension after this API
 addition. No model configuration switch or environment variable is added.
 See [benchmark instructions](../../../benchmarks/README_lim_age.md) for all-hit,
 all-miss and eager/graph commands. The existing score operator is unchanged.
+
+Hit clearing now uses temporary Source-block lists in existing UB storage and
+read/modify/write DMA for each touched 512-source block. Local scalar clears
+replace per-Hit GM writes and cache-line flushes. Increment and Miss updates are
+unchanged; rebuild before comparing the existing all-hit diagnostic timings.
+No NPU speedup has been verified locally.

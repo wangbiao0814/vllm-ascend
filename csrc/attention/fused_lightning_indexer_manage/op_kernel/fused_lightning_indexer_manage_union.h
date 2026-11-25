@@ -249,17 +249,50 @@ private:
 
     __aicore__ inline void ClearAgeHits(uint32_t query, uint32_t row) {
         const int32_t misses = LoadAgeCount(routeMissCountsGm, static_cast<uint64_t>(query) * ROUTE_COUNT_STRIDE);
-        if (misses < 0 || misses > static_cast<int32_t>(TOPK)) return;
-        LocalTensor<int32_t> sources = pairInBuf.Get<float>().ReinterpretCast<int32_t>();
+        if (misses < 0 || misses >= static_cast<int32_t>(TOPK)) return;
+        constexpr uint32_t MAX_HIT_BLOCKS =
+            (LIMConfig::MAX_SOURCE_CAPACITY + LIMAge::HIT_BLOCK_SIZE - 1U) / LIMAge::HIT_BLOCK_SIZE;
+        static_assert(MAX_HIT_BLOCKS <= CAPACITY, "Hit bucket heads must fit unionSourceBuf");
+        static_assert(TOPK <= OCCURRENCE_CAPACITY, "Hit links must fit occurrenceBuf");
+        static_assert(TOPK + LIMAge::HIT_BLOCK_SIZE <= CAPACITY * 2U,
+                      "Touched blocks and age tile must fit pairOutBuf");
+        // All four union buffers are idle before ProcessGeneralizedSteady.
+        // Reuse them without increasing persistent state or the UB allocation.
+        LocalTensor<int32_t> sources = pairInBuf.Get<int32_t>();
+        LocalTensor<int32_t> heads = unionSourceBuf.Get<int32_t>();
+        LocalTensor<int32_t> next = occurrenceBuf.Get<int32_t>();
+        LocalTensor<int32_t> touched = pairOutBuf.Get<int32_t>();
+        LocalTensor<int32_t> ageTile = pairOutBuf.Get<int32_t>()[TOPK];
+        const uint32_t blocks =
+            (sourceCapacity + LIMAge::HIT_BLOCK_SIZE - 1U) / LIMAge::HIT_BLOCK_SIZE;
+        Duplicate(heads, -1, blocks);
         DataCopyPad(sources, topkSourcesGm[static_cast<uint64_t>(query) * TOPK],
                     AscendC::DataCopyExtParams{1, TOPK * sizeof(int32_t), 0, 0, 0},
                     AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
+        Sync<HardEvent::V_S>(HardEvent::V_S);
         Sync<HardEvent::MTE2_S>(HardEvent::MTE2_S);
+        uint32_t touchedCount = 0U;
         for (uint32_t i = static_cast<uint32_t>(misses); i < TOPK; ++i) {
-            const int32_t source = sources.GetValue(i);
-            if (source >= 0 && static_cast<uint32_t>(source) < sourceCapacity)
-                WriteAge(static_cast<uint64_t>(row) * sourceCapacity + source, 0);
+            LIMAge::AppendHitBlock(sources.GetValue(i), i, sourceCapacity,
+                                   heads, next, touched, touchedCount);
         }
+        const uint64_t base = static_cast<uint64_t>(row) * sourceCapacity;
+        for (uint32_t i = 0U; i < touchedCount; ++i) {
+            const uint32_t block = static_cast<uint32_t>(touched.GetValue(i));
+            const uint32_t start = block * LIMAge::HIT_BLOCK_SIZE;
+            const uint32_t count = LICommon::Min(LIMAge::HIT_BLOCK_SIZE, sourceCapacity - start);
+            const AscendC::DataCopyExtParams copy{1, static_cast<uint32_t>(count * sizeof(int32_t)), 0, 0, 0};
+            DataCopyPad(ageTile, agesGm_[base + start], copy,
+                        AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
+            Sync<HardEvent::MTE2_S>(HardEvent::MTE2_S);
+            LIMAge::ClearHitBlock(heads.GetValue(block), sources, next, ageTile);
+            Sync<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+            DataCopyPad(agesGm_[base + start], ageTile, copy);
+            // Complete DMA before the next tile reuses ageTile and before
+            // candidate selection reads the updated ages. No per-Hit DCCI.
+            Sync<HardEvent::MTE3_S>(HardEvent::MTE3_S);
+        }
+        Sync<HardEvent::S_V>(HardEvent::S_V);
     }
 
     __aicore__ inline void FinishAge(uint32_t batch) {

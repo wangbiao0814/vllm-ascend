@@ -230,3 +230,23 @@ def test_age_rejects_invalid_diagnostic_flags(flags):
     case = _build_case(q_values=[1], states=[-1], offload_len=8192, cache_tokens=4096)
     with pytest.raises(RuntimeError, match="diagnostic_flags"):
         call_age(case, case.cache_seed.clone(), torch.zeros_like(case.cache_seed), _make_outputs(case), 4, flags)
+
+
+@torch.inference_mode()
+def test_age_buffered_hit_clear_all_hit_partial_block():
+    case = _build_case(q_values=[1], states=[-1], offload_len=8320, cache_tokens=4096)
+    selected = _native_topk(case)[0].cpu().long()
+    selected_set = set(selected.tolist())
+    fillers = [s for s in range(case.offload_key[0]) if s not in selected_set][: case.cache_tokens[0] - TOPK]
+    residents = torch.cat((selected, torch.tensor(fillers, dtype=torch.long))).to("npu")
+    cache = case.cache_seed.clone()
+    row = case.req_entries[0]
+    cache[row].fill_(-(1 << 31))
+    cache[row, residents] = torch.arange(case.cache_tokens[0], dtype=torch.int32, device="npu")
+    ages = torch.arange(cache.shape[1], dtype=torch.int32, device="npu").expand_as(cache).contiguous()
+    before_cache, before_ages = cache.cpu(), ages.cpu()
+    outputs = _make_outputs(case)
+    call_age(case, cache, ages, outputs, 4)
+    check_age_step(case, cache, ages, outputs, before_cache, before_ages, 4)
+    assert int(outputs[2].cpu()[0]) == 0
+    assert torch.equal(cache.cpu(), before_cache)
