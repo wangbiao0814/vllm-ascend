@@ -250,3 +250,86 @@ hashes, loaded module paths, and Git revisions when available. Use these fields
 to verify which implementations were compared. Compare results within the same
 environment and workload, including sparse cases that may have constant-factor
 tradeoffs; local metadata speedups do not establish end-to-end serving gains.
+
+## A3 DCP16 Indexer Top-K
+
+[`benchmark_dcp_indexer_topk.py`](benchmark_dcp_indexer_topk.py) measures the
+candidate path for Kimi-K3.1-Pro INT8 decode on one A3 server with 16 visible
+dies (one rank per die, TP16/DCP16/PCP1). It generates replicated INT8 queries,
+BF16 weights, FP16 scales, paged INT8 key shards, and native QLI metadata.
+The defaults use 64 replicated heads of width 128, 128-token kernel pages,
+and a 768-token DCP interleave. Use `--heads` and `--interleave` to match
+your deployment. [Kimi-K3.1-Pro A3 deployment guide](../docs/source/tutorials/models/Kimi-K3.1-Pro.md)
+
+The QLI mode runs `DeviceOperator.indexer_select_dcp_candidates` (including
+normalization), followed by production `distributed_topk` at K=2048. That
+call sorts and packs each tile, runs real HCCL AllGather on the vLLM DCP
+group, then merges into owner-local IDs or global IDs. Owner-local output
+contains this rank's globally selected winners, compacted and padded with
+`-1`. Global output contains the same globally ordered Top-K on every rank,
+with the coordinate system relevant to sparse KV offload.
+
+The benchmark times eager candidate selection and exchange. It prepares
+QLI metadata once per case and keeps tensor creation and validation outside
+the measured steps. Model projections, quantization, cache writes, main
+attention, KV offload I/O, and ACL graph replay are outside its scope.
+
+### Run on the server
+
+Use the matching vLLM, vLLM Ascend A3 extension, CANN, torch_npu, and
+Triton Ascend environment. Run from the checkout root with 16 idle A3 dies
+visible in the same order as your deployment. These HCCL settings match the
+repository's A3 Decode template.
+
+```bash
+export HCCL_OP_EXPANSION_MODE=AIV HCCL_BUFFSIZE=1024
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+
+# Correctness smoke run, including short history and uneven local lengths.
+torchrun --standalone --nproc-per-node=16 benchmarks/benchmark_dcp_indexer_topk.py \
+  --queries 1 --context-lengths 1024 32768 --warmup 2 --iterations 3
+
+# Eager QLI through merged Top-K, both ID modes.
+torchrun --standalone --nproc-per-node=16 benchmarks/benchmark_dcp_indexer_topk.py \
+  --queries 1 4 12 32 64 --context-lengths 32768 131072 --id-mode both
+
+# Prebuilt candidates isolate sort/pack, HCCL and merge.
+# Q=1025 crosses the production 1024-row collective tile boundary.
+torchrun --standalone --nproc-per-node=16 benchmarks/benchmark_dcp_indexer_topk.py \
+  --input synthetic --queries 1 64 1025 --context-lengths 32768 --id-mode both
+
+# Trace a warmed shape on all 16 ranks.
+torchrun --standalone --nproc-per-node=16 benchmarks/benchmark_dcp_indexer_topk.py \
+  --queries 12 --context-lengths 131072 --id-mode both \
+  --profile-dir /tmp/dcp-indexer-traces --profile-steps 3
+```
+
+`--queries` and `--context-lengths` form a Cartesian sweep. Context length
+counts global tokens per request, including the current query suffix. Each
+query is a separate request by default. Using `--queries 12` with
+`--queries-per-request 3` models four requests with three causal query rows
+each. K history storage grows with request count and context length.
+
+### Read the results
+
+Rank 0 prints one JSON line per case and ID mode. It includes local contexts
+for all ranks, the number of collectives per step, and the packed input
+bytes per rank (INT32 ID plus FP32 score bits for each candidate). The byte
+count is the logical input size. Each sample is the maximum across ranks
+of host elapsed time through device synchronization. The JSON reports the
+samples, p50, and p95. CPU barriers and warmup run outside this timing.
+
+Before timing, the script checks sampled rows, including the first tile
+boundary if present, for valid local IDs, causal bounds, candidate counts,
+and padding. It compares each rank's output against a CPU sort of all
+ranks' candidate scores and IDs. The CPU check verifies candidate validity
+and exchange semantics using QLI's returned scores.
+
+In each trace case directory, open the rank-specific Ascend profiler output
+in MindStudio Insight or load its trace timeline in a compatible viewer.
+Find `dcp_indexer.step`, `dcp_indexer.local_qli` (native QLI dispatch and
+nested `dcp_indexer.normalize`), `dcp_indexer.sort_pack`,
+`dcp_indexer.all_gather`, and `dcp_indexer.merge`. Sort and pack share a
+scope because production can fuse them. Use the NPU and HCCL lanes for
+device durations and the CPU scopes to correlate dispatch. The optional
+trace runs after the timing samples for that case.
