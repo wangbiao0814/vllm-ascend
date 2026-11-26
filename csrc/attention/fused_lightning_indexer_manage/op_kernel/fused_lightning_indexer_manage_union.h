@@ -293,7 +293,7 @@ private:
         constexpr uint32_t BANK_WORDS = 5U * LIMAge::TILE;
         static_assert(2U * BANK_WORDS <= CAPACITY * 2U, "Both age banks must fit existing sort scratch");
         const bool pipelined = (diagnosticFlags_ & LIMAge::DOUBLE_BUFFER_AGE) != 0U;
-        event_t writeDone[2] = {};
+        AscendC::TEventID writeDone[2] = {};
         bool pending[2] = {false, false};
         if (pipelined) {
             writeDone[0] = GetTPipePtr()->AllocEventID<HardEvent::MTE3_MTE2>();
