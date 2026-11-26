@@ -135,3 +135,10 @@ requires complete increment/Hit-clear stages (no bits 1,2,8,16,32). Mask range i
 [0,8191]. Benchmark `age-update-breakdown` compares the three optimization steps
 and the former vector path. NPU compilation, correctness and speedup await server
 validation.
+
+Experimental flag 8192 enables two-bank prefetch/deferred writeback for merged
+updates; it requires bit 4096. The new maximum mask is 16383. Benchmark
+`merged-double-buffer` selects 14336 and retains the single-buffer variant as a
+control. Banks reuse disjoint regions of sort scratch; independently allocated
+MTE3-to-MTE2 events guard bank reuse, and both banks are drained before eviction.
+No model config routing/default is changed. CANN/NPU validation is pending.

@@ -274,28 +274,60 @@ private:
         return local.GetValue(0);
     }
 
+    __aicore__ inline void LoadAgeBlock(uint64_t base, uint32_t start, uint32_t count,
+                                       uint32_t bank, uint32_t stride) {
+        LocalTensor<int32_t> tile = pairOutBuf.Get<int32_t>()[bank * stride];
+        const AscendC::DataCopyExtParams copy{1, static_cast<uint32_t>(count * sizeof(int32_t)), 0, 0, 0};
+        DataCopyPad(tile, agesGm_[base + start], copy,
+                    AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
+        DataCopyPad(tile[LIMAge::TILE], cacheSlotsGm[base + start], copy,
+                    AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
+    }
+
     // Run before eviction: the map still describes the old residents.
     // Reuse dead sort scratch; no persistent map or additional UB allocation.
     __aicore__ inline void UpdateAllAgeBlocks(uint32_t row, uint32_t length, uint32_t runs) {
         LocalTensor<int32_t> sources = occurrenceBuf.Get<uint32_t>().ReinterpretCast<int32_t>();
         LocalTensor<int32_t> blocks = unionSourceBuf.Get<int32_t>();
         LocalTensor<int32_t> starts = blocks[TOPK], ends = blocks[2U * TOPK];
-        LocalTensor<int32_t> tile = pairOutBuf.Get<int32_t>();
-        LocalTensor<int32_t> slots = tile[LIMAge::TILE];
-        LocalTensor<float> value = tile[2U * LIMAge::TILE].ReinterpretCast<float>();
-        LocalTensor<uint32_t> sign = tile[3U * LIMAge::TILE].ReinterpretCast<uint32_t>();
-        LocalTensor<uint8_t> mask = tile[4U * LIMAge::TILE].ReinterpretCast<uint8_t>();
+        constexpr uint32_t BANK_WORDS = 5U * LIMAge::TILE;
+        static_assert(2U * BANK_WORDS <= CAPACITY * 2U, "Both age banks must fit existing sort scratch");
+        const bool pipelined = (diagnosticFlags_ & LIMAge::DOUBLE_BUFFER_AGE) != 0U;
+        event_t writeDone[2] = {};
+        bool pending[2] = {false, false};
+        if (pipelined) {
+            writeDone[0] = GetTPipePtr()->AllocEventID<HardEvent::MTE3_MTE2>();
+            writeDone[1] = GetTPipePtr()->AllocEventID<HardEvent::MTE3_MTE2>();
+        }
         const uint64_t base = static_cast<uint64_t>(row) * sourceCapacity;
-        uint32_t run = 0U;
-        for (uint32_t remaining = length; remaining != 0U;) {
+        uint32_t run = 0U, iteration = 0U;
+        if (pipelined && length != 0U) {
+            const uint32_t first = ((length - 1U) / LIMAge::TILE) * LIMAge::TILE;
+            LoadAgeBlock(base, first, length - first, 0U, BANK_WORDS);
+        }
+        for (uint32_t remaining = length; remaining != 0U; ++iteration) {
+            const uint32_t bank = pipelined ? iteration & 1U : 0U;
+            LocalTensor<int32_t> tile = pairOutBuf.Get<int32_t>()[bank * BANK_WORDS];
+            LocalTensor<int32_t> slots = tile[LIMAge::TILE];
+            LocalTensor<float> value = tile[2U * LIMAge::TILE].ReinterpretCast<float>();
+            LocalTensor<uint32_t> sign = tile[3U * LIMAge::TILE].ReinterpretCast<uint32_t>();
+            LocalTensor<uint8_t> mask = tile[4U * LIMAge::TILE].ReinterpretCast<uint8_t>();
             const uint32_t start = ((remaining - 1U) / LIMAge::TILE) * LIMAge::TILE;
             const uint32_t count = remaining - start;
             const AscendC::DataCopyExtParams copy{1, static_cast<uint32_t>(count * sizeof(int32_t)), 0, 0, 0};
-            DataCopyPad(tile, agesGm_[base + start], copy,
-                        AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
-            DataCopyPad(slots, cacheSlotsGm[base + start], copy,
-                        AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
+            if (!pipelined) LoadAgeBlock(base, start, count, bank, BANK_WORDS);
             Sync<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+            // Queue the next read before updating this bank. A bank can be
+            // overwritten only after its previous output DMA has completed.
+            if (pipelined && start != 0U) {
+                const uint32_t nextBank = bank ^ 1U;
+                if (pending[nextBank]) {
+                    WaitFlag<HardEvent::MTE3_MTE2>(writeDone[nextBank]);
+                    pending[nextBank] = false;
+                }
+                const uint32_t nextStart = ((start - 1U) / LIMAge::TILE) * LIMAge::TILE;
+                LoadAgeBlock(base, nextStart, start - nextStart, nextBank, BANK_WORDS);
+            }
             Cast(value, tile, RoundMode::CAST_NONE, count);
             PipeBarrier<PIPE_V>();
             Maxs(value, value, 0.0F, count);
@@ -323,9 +355,24 @@ private:
             Sync<HardEvent::S_MTE3>(HardEvent::S_MTE3);
             Sync<HardEvent::V_MTE3>(HardEvent::V_MTE3);
             DataCopyPad(agesGm_[base + start], tile, copy);
-            Sync<HardEvent::MTE3_S>(HardEvent::MTE3_S);
-            Sync<HardEvent::MTE3_V>(HardEvent::MTE3_V);
+            if (pipelined) {
+                SetFlag<HardEvent::MTE3_MTE2>(writeDone[bank]);
+                pending[bank] = true;
+            } else {
+                Sync<HardEvent::MTE3_S>(HardEvent::MTE3_S);
+                Sync<HardEvent::MTE3_V>(HardEvent::MTE3_V);
+            }
             remaining = start;
+        }
+        if (pipelined) {
+            // Drain both banks before scratch reuse and eviction reads.
+            for (uint32_t bank = 0U; bank < 2U; ++bank) {
+                if (pending[bank]) WaitFlag<HardEvent::MTE3_MTE2>(writeDone[bank]);
+            }
+            Sync<HardEvent::MTE2_S>(HardEvent::MTE2_S);
+            Sync<HardEvent::MTE3_V>(HardEvent::MTE3_V);
+            GetTPipePtr()->ReleaseEventID<HardEvent::MTE3_MTE2>(writeDone[0]);
+            GetTPipePtr()->ReleaseEventID<HardEvent::MTE3_MTE2>(writeDone[1]);
         }
         Sync<HardEvent::S_V>(HardEvent::S_V);
     }

@@ -89,7 +89,7 @@ class TestDiagnosticSpec(unittest.TestCase):
                 decode_probe(invalid)
 
     def test_age_update_breakdown_preserves_full_policy(self):
-        self.assertEqual([ABLATIONS[name] for name in AGE_UPDATE_BREAKDOWN], [0, 2048, 6144, 1024])
+        self.assertEqual([ABLATIONS[name] for name in AGE_UPDATE_BREAKDOWN], [0, 2048, 6144, 14336, 1024])
         for name in AGE_UPDATE_BREAKDOWN:
             with patch("sys.argv", ["bench", "--ablation", name, "--dry-run"]):
                 self.assertEqual(parse_args().ablation, name)

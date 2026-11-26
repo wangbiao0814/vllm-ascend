@@ -35,7 +35,7 @@ FINISH_BREAKDOWN = (
     "scalar-finish-check-only",
     "scalar-finish-count-only",
 )
-AGE_UPDATE_BREAKDOWN = ("normal", "range-hit-clear", "merged-age-update", "vector-hit-runs")
+AGE_UPDATE_BREAKDOWN = ("normal", "range-hit-clear", "merged-age-update", "merged-double-buffer", "vector-hit-runs")
 PROBE_WORDS = 16
 PROBE_MAGIC = 0x4C494D41
 REPORT_PROBE = 128
@@ -44,6 +44,7 @@ ABLATIONS = {
     "normal": 0,
     "range-hit-clear": 2048,
     "merged-age-update": 6144,
+    "merged-double-buffer": 14336,
     "vector-hit-runs": 1024,
     "no-hit-clear": 1,
     "no-increment": 2,
@@ -105,7 +106,15 @@ def parse_args():
     if args.scenario == "all-miss" and args.length < args.capacity + TOPK:
         parser.error("all-miss requires length >= capacity + 2048")
     if (
-        args.ablation not in ("normal", "scalar-hit-runs", "range-hit-clear", "merged-age-update", "vector-hit-runs")
+        args.ablation
+        not in (
+            "normal",
+            "scalar-hit-runs",
+            "range-hit-clear",
+            "merged-age-update",
+            "merged-double-buffer",
+            "vector-hit-runs",
+        )
         and args.scenario == "trace"
     ):
         parser.error("Diagnostic ablations require all-hit or all-miss; they do not preserve the age policy")
@@ -376,7 +385,7 @@ def run(args, spec):
                     "policy": policy,
                     "ablation": ablation,
                     "diagnostic_flags": flags,
-                    "policy_valid": (flags & ~(64 | 1024 | 2048 | 4096)) == 0,
+                    "policy_valid": (flags & ~(64 | 1024 | 2048 | 4096 | 8192)) == 0,
                     "hits": accesses - sum(misses),
                     "misses": sum(misses),
                     "accesses": accesses,

@@ -225,7 +225,7 @@ def test_age_diagnostic_flags_control_state_updates(flags):
     _assert_resident_bijection(cache[row].cpu(), prefix, case.cache_tokens[0])
 
 
-@pytest.mark.parametrize("flags", [-1, 8192, 4097, 4098, 4104, 4112, 4128])
+@pytest.mark.parametrize("flags", [-1, 16384, 8192, 4097, 4098, 4104, 4112, 4128])
 @torch.inference_mode()
 def test_age_rejects_invalid_diagnostic_flags(flags):
     case = _build_case(q_values=[1], states=[-1], offload_len=8192, cache_tokens=4096)
@@ -233,8 +233,9 @@ def test_age_rejects_invalid_diagnostic_flags(flags):
         call_age(case, case.cache_seed.clone(), torch.zeros_like(case.cache_seed), _make_outputs(case), 4, flags)
 
 
+@pytest.mark.parametrize("flags", [0, 6144, 14336])
 @torch.inference_mode()
-def test_age_buffered_hit_clear_all_hit_partial_block():
+def test_age_buffered_hit_clear_all_hit_partial_block(flags):
     case = _build_case(q_values=[1], states=[-1], offload_len=8320, cache_tokens=4096)
     selected = _native_topk(case)[0].cpu().long()
     selected_set = set(selected.tolist())
@@ -247,7 +248,7 @@ def test_age_buffered_hit_clear_all_hit_partial_block():
     ages = torch.arange(cache.shape[1], dtype=torch.int32, device="npu").expand_as(cache).contiguous()
     before_cache, before_ages = cache.cpu(), ages.cpu()
     outputs = _make_outputs(case)
-    call_age(case, cache, ages, outputs, 4)
+    call_age(case, cache, ages, outputs, 4, diagnostic_flags=flags)
     check_age_step(case, cache, ages, outputs, before_cache, before_ages, 4)
     assert int(outputs[2].cpu()[0]) == 0
     assert torch.equal(cache.cpu(), before_cache)
@@ -258,7 +259,7 @@ def test_age_buffered_hit_clear_all_hit_partial_block():
 def test_age_vector_and_scalar_grouping_match(length):
     case = _build_case(q_values=[1], states=[-1], offload_len=length, cache_tokens=4096)
     results = []
-    for flags in (0, 64, 1024, 2048, 6144):
+    for flags in (0, 64, 1024, 2048, 6144, 14336):
         cache = case.cache_seed.clone()
         ages = torch.arange(cache.shape[1], dtype=torch.int32, device="npu").expand_as(cache).contiguous()
         outputs = _make_outputs(case)
@@ -277,7 +278,7 @@ def test_age_vector_and_scalar_grouping_match(length):
             assert torch.equal(left[index][0, :count], right[index][0, :count])
 
 
-@pytest.mark.parametrize("flags,phase", [(0, 3), (64, 3), (4, 0), (256, 2), (512, 1)])
+@pytest.mark.parametrize("flags,phase", [(0, 3), (64, 3), (4, 0), (256, 2), (512, 1), (14336, 3)])
 @torch.inference_mode()
 def test_age_probe_preserves_valid_outputs_and_reports_stages(flags, phase):
     case = _build_case(q_values=[1], states=[-1], offload_len=8192, cache_tokens=4096)
@@ -315,7 +316,7 @@ def test_age_probe_preserves_valid_outputs_and_reports_stages(flags, phase):
         assert probe["raw_block_count"] == probe["effective_runs"]
 
 
-@pytest.mark.parametrize("flags", [0, 2048, 6144])
+@pytest.mark.parametrize("flags", [0, 2048, 6144, 14336])
 @torch.inference_mode()
 def test_age_update_variants_repeated_graph(flags):
     case = _build_case(q_values=[1], states=[-1], offload_len=8320, cache_tokens=4096)
@@ -332,3 +333,24 @@ def test_age_update_variants_repeated_graph(flags):
         before_cache, before_ages = cache.cpu(), ages.cpu()
         graph.replay()
         check_age_step(case, cache, ages, outputs, before_cache, before_ages, 4)
+
+
+@pytest.mark.parametrize("flags", [6144, 14336])
+@torch.inference_mode()
+def test_age_merged_all_miss(flags):
+    case = _build_case(q_values=[1], states=[-1], offload_len=8320, cache_tokens=4096)
+    capacity = case.cache_tokens[0]
+    selected = set(_native_topk(case)[0].cpu().tolist())
+    residents = [source for source in range(case.offload_key[0]) if source not in selected][:capacity]
+    cache = case.cache_seed.clone()
+    row = case.req_entries[0]
+    cache[row].fill_(-(1 << 31))
+    cache[row, torch.tensor(residents, dtype=torch.long, device="npu")] = torch.arange(
+        capacity, dtype=torch.int32, device="npu"
+    )
+    ages = torch.full_like(cache, 7)
+    before_cache, before_ages = cache.cpu(), ages.cpu()
+    outputs = _make_outputs(case)
+    call_age(case, cache, ages, outputs, 4, diagnostic_flags=flags)
+    check_age_step(case, cache, ages, outputs, before_cache, before_ages, 4)
+    assert int(outputs[2].cpu()[0]) == TOPK

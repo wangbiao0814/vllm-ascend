@@ -485,3 +485,41 @@ Other diagnostic bits retain their meaning. Historical breakdowns without mask
 comparisons. Add `--diagnostics --profile-dir lim_age_update_profiles` for an
 untimed profiler pass; report actual kernel durations separately from Event times.
 CPU helper/model checks do not establish CANN compatibility or NPU performance.
+
+## Double-buffer merged update experiment
+
+`merged-double-buffer` (flags 14336 = 6144 + 8192) preserves the merged update
+policy and uses two disjoint banks of the existing sort scratch. Each bank owns
+an age tile, resident map tile, float values, sign/zero values and compare mask.
+Two banks occupy 20 KiB within the existing 64-KiB buffer; no new UB buffer or
+persistent state is allocated. A compile-time bound checks this layout.
+
+The first block is loaded before the loop. After waiting for the current block,
+the next block's reads are queued before current-block computation. Writeback is
+not waited immediately: each bank has a separately allocated MTE3-to-MTE2 event,
+consumed before that bank is reloaded. The final drain consumes both pending
+events, waits for scratch reuse and releases the event IDs before eviction.
+This offers overlap; actual overlap and speedup require NPU profiling.
+
+Rebuild the age extension/kernel, then compare the single- and double-buffer
+versions together:
+
+```bash
+python -m benchmarks.benchmark_lim_age --scenario all-hit \
+  --ablation age-update-breakdown --mode eager --steps 32 \
+  --repeats 30 --latency-samples 8 --output lim_age_double_buffer.json
+```
+
+The breakdown now includes `merged-double-buffer`. Run the same command with
+`--scenario all-miss` to check the no-Hit path. For NPU correctness/graph tests:
+
+```bash
+python -m pytest --noconftest -sv \
+  tests/e2e/nightly/single_node/ops/singlecard_ops/test_fused_lightning_indexer_age_manage.py \
+  -k 'update_variants or grouping_match or all_hit_partial_block or probe_preserves or merged_all_miss'
+```
+
+The mask range is [0,16383]; bit 8192 requires merged update (4096). Existing
+merged-stage compatibility checks still apply. This is benchmark/operator-only;
+no model config option or default change is introduced. Local CPU checks cannot
+validate hardware events, CANN compilation or device performance.

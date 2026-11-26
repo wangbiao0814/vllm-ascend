@@ -29,7 +29,7 @@ inline void npu_fused_lightning_indexer_age_manage(
               "probation_age exceeds the supported age range.");
   TORCH_CHECK(diagnostic_flags >= 0 && diagnostic_flags <= LIMAge::DIAGNOSTIC_MASK &&
               LIMAge::ValidDiagnostic(static_cast<uint32_t>(diagnostic_flags)),
-              "diagnostic_flags must be in [0,8191]; merged updates cannot combine with skip increment/Hit clear or partial Hit stages.");
+              "diagnostic_flags must be in [0,16383]; merged updates cannot combine with skip increment/Hit clear or partial Hit stages.");
   constexpr int64_t kTopK = LIMConfig::TOPK;
   constexpr int64_t kMissCapacity = LIMConfig::MISS_CAPACITY;
   constexpr int64_t kBlockSize = LIMConfig::CACHE_BLOCK_SIZE;
