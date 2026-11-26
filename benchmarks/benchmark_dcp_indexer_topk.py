@@ -40,12 +40,22 @@ def parse_args():
     parser.add_argument(
         "--exchange", choices=["flat", "hierarchical", "both"], default="flat", help="Candidate exchange topology"
     )
+    parser.add_argument(
+        "--collective-stage",
+        choices=["chain", "intra", "cross", "all"],
+        default="chain",
+        help="Hierarchical communication-only cases to measure: chained, first round, second round, or all three",
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--profile-dir", type=Path, help="Write a separate torch_npu trace per case and rank")
     parser.add_argument("--profile-steps", type=int, default=3)
     args = parser.parse_args()
+    if args.collective_stage != "chain" and (args.input != "collective" or args.exchange == "flat"):
+        parser.error(
+            "--collective-stage intra/cross/all requires --input collective and --exchange hierarchical or both"
+        )
     if min(args.queries_per_request, args.interleave, args.warmup, args.iterations, args.profile_steps) < 1:
         parser.error("queries-per-request, interleave, warmup, iterations and profile-steps must be positive")
     if any(rows < 1 or rows % args.queries_per_request for rows in args.queries):
@@ -427,6 +437,16 @@ def run_collective_cases(args, group, device, subgroups, exchanges):
 
     from vllm_ascend.attention.context_parallel.sharded_indexer import PACKED_PAIR_BYTES, gathered_candidate_row_tile
 
+    cases = []
+    if "flat" in exchanges:
+        cases.append(("flat", "flat", (group,)))
+    if "hierarchical" in exchanges:
+        intra, cross = subgroups
+        stages = ("intra", "cross", "chain") if args.collective_stage == "all" else (args.collective_stage,)
+        groups_by_stage = {"intra": (intra,), "cross": (cross,), "chain": subgroups}
+        cases.extend(("hierarchical", stage, groups_by_stage[stage]) for stage in stages)
+    leader_by_rank = {rank: group.ranks[index // GROUP_SIZE * GROUP_SIZE] for index, rank in enumerate(group.ranks)}
+
     for rows in args.queries:
         tile = gathered_candidate_row_tile(rows, WORLD_SIZE, TOPK)
         last_start = (rows - 1) // tile * tile
@@ -435,15 +455,17 @@ def run_collective_cases(args, group, device, subgroups, exchanges):
         row_ids = torch.arange(rows, dtype=torch.int32)
         markers = torch.stack((row_ids, torch.full_like(row_ids, group.rank)), dim=-1)
         packed = markers[:, None, :].expand(-1, TOPK, -1).contiguous().to(device)
-        for topology in exchanges:
-            grouped = topology == "hierarchical"
-            groups = subgroups if grouped else (group,)
+        for topology, stage, groups in cases:
             group_sizes = [g.world_size for g in groups]
-            senders = (
-                [group.ranks[group.ranks.index(rank) // GROUP_SIZE * GROUP_SIZE] for rank in groups[-1].ranks]
-                if grouped
-                else group.ranks
-            )
+            senders = groups[-1].ranks
+            send = packed
+            if stage == "cross":
+                # Materialize the same input as the chained cross-group call before timing.
+                cross_markers = markers.clone()
+                cross_markers[:, 1] = leader_by_rank[group.rank]
+                send = cross_markers[:, None, :].expand(-1, TOPK, -1).contiguous().to(device)
+            if stage in ("cross", "chain"):
+                senders = [leader_by_rank[rank] for rank in senders]
             expected_markers = torch.tensor(
                 [[(row, rank) for row in range(last_start, rows)] for rank in senders], dtype=torch.int32
             )
@@ -456,11 +478,13 @@ def run_collective_cases(args, group, device, subgroups, exchanges):
                 # Check both ends of each sender's rows without copying the full receive buffer to CPU.
                 return torch.equal(markers[:, :, 0].cpu(), expected) and torch.equal(markers[:, :, -1].cpu(), expected)
 
-            case = f"collective-{topology}-q{rows}"
-            verify_output(check_output(exchange(packed)), group, case + " payload check")
+            suffix = f"-{stage}" if stage in ("intra", "cross") else ""
+            case = f"collective-{topology}{suffix}-q{rows}"
+            verify_output(check_output(exchange(send)), group, case + " payload check")
             report = {
                 "case": case,
                 "exchange": topology,
+                "collective_stage": stage,
                 "input": args.input,
                 "queries": rows,
                 "topk": TOPK,
@@ -471,7 +495,16 @@ def run_collective_cases(args, group, device, subgroups, exchanges):
                 "packed_input_bytes_per_rank": payload,
                 "logical_recv_bytes_per_rank": payload * sum(size - 1 for size in group_sizes),
             }
-            measure_case(args, group, subgroups if grouped else None, None, packed, exchange, check_output, report)
+            measure_case(
+                args,
+                group,
+                subgroups if topology == "hierarchical" else None,
+                None,
+                send,
+                exchange,
+                check_output,
+                report,
+            )
 
 
 def run_cases(args, group, device, device_operator, subgroups=None):

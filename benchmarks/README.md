@@ -330,6 +330,12 @@ torchrun --standalone --nproc-per-node=16 benchmarks/benchmark_dcp_indexer_topk.
 torchrun --standalone --nproc-per-node=16 benchmarks/benchmark_dcp_indexer_topk.py \
   --input collective --exchange both --queries 64 --mode both --iterations 100
 
+# Compare and trace flat, each standalone round, and the chained rounds.
+torchrun --standalone --nproc-per-node=16 benchmarks/benchmark_dcp_indexer_topk.py \
+  --input collective --exchange both --collective-stage all --queries 64 \
+  --mode both --warmup 20 --iterations 100 \
+  --profile-dir /tmp/dcp-q64-stage-traces --profile-steps 5
+
 # Trace a single warmed ACL Graph replay of the global-ID path.
 torchrun --standalone --nproc-per-node=16 benchmarks/benchmark_dcp_indexer_topk.py \
   --mode graph --queries 12 --context-lengths 131072 --id-mode global \
@@ -352,9 +358,14 @@ each. K history storage grows with request count and context length.
 payloads with the same shape and tile boundaries as the Top-K benchmark.
 The two-level case takes one rank-sized slice of the first AllGather
 output as the second AllGather's input. This preserves the dependency and
-payload size without running a merge or copy between the calls. There is
-one output sample per topology and execution mode, independent of
-`--id-mode` and `--context-lengths`. Latency includes collective dispatch
+payload size without running a merge or copy between the calls.
+`--collective-stage chain` is the default. With `--exchange hierarchical`,
+choose `intra` to run the first round alone or `cross` to run the second
+round alone on prebuilt input identical to that of the chained case.
+`all` runs both standalone cases and the chain. In each standalone case,
+all four subgroups for that round participate concurrently.
+Results are independent of `--id-mode` and `--context-lengths`.
+Latency includes collective dispatch
 and the final device synchronization. The benchmark checks sampled
 sender and row markers in the last tile outside timing, including after
 graph replay.
@@ -365,7 +376,9 @@ Rank 0 prints one JSON line per case, ID mode, `exchange`, and
 `execution_mode`. Hierarchical and graph cases add `-hierarchical` and
 `-graph` suffixes to their names and trace directories. Each line includes
 the subgroup sizes, number of collectives, and `logical_recv_bytes_per_rank`
-per step. At Q=64 this is 15 MiB for flat and 6 MiB for hierarchical.
+per step. At Q=64 this is 15 MiB for flat, 3 MiB for either standalone
+round, and 6 MiB for the chain. Communication-only cases also report
+`collective_stage`.
 The estimate counts candidate bytes from peers, excluding the local
 contribution and HCCL protocol traffic. Synthetic timings include local
 sort/pack, AllGather, and merge. Each sample is the maximum across ranks
