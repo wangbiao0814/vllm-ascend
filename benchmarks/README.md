@@ -326,6 +326,10 @@ torchrun --standalone --nproc-per-node=16 benchmarks/benchmark_dcp_indexer_topk.
 torchrun --standalone --nproc-per-node=16 benchmarks/benchmark_dcp_indexer_topk.py \
   --input synthetic --exchange both --queries 64 --context-lengths 131072 --id-mode both
 
+# Measure the AllGather calls alone, in eager and ACL Graph modes.
+torchrun --standalone --nproc-per-node=16 benchmarks/benchmark_dcp_indexer_topk.py \
+  --input collective --exchange both --queries 64 --mode both --iterations 100
+
 # Trace a single warmed ACL Graph replay of the global-ID path.
 torchrun --standalone --nproc-per-node=16 benchmarks/benchmark_dcp_indexer_topk.py \
   --mode graph --queries 12 --context-lengths 131072 --id-mode global \
@@ -344,6 +348,17 @@ query is a separate request by default. Using `--queries 12` with
 `--queries-per-request 3` models four requests with three causal query rows
 each. K history storage grows with request count and context length.
 
+`--input collective` sweeps query rows only. It uses prepacked INT32
+payloads with the same shape and tile boundaries as the Top-K benchmark.
+The two-level case takes one rank-sized slice of the first AllGather
+output as the second AllGather's input. This preserves the dependency and
+payload size without running a merge or copy between the calls. There is
+one output sample per topology and execution mode, independent of
+`--id-mode` and `--context-lengths`. Latency includes collective dispatch
+and the final device synchronization. The benchmark checks sampled
+sender and row markers in the last tile outside timing, including after
+graph replay.
+
 ### Read the results
 
 Rank 0 prints one JSON line per case, ID mode, `exchange`, and
@@ -361,9 +376,10 @@ Before timing, the script checks sampled rows, including the first tile
 boundary if present, for valid local IDs, causal bounds, candidate counts,
 and padding. It compares each rank's output against a CPU sort of all
 ranks' candidate scores and IDs. The CPU check verifies candidate validity
-and exchange semantics using QLI's returned scores.
-In graph mode, replay must also overwrite the output buffer and match the
-full eager output on every rank, including rows outside the CPU sample.
+and exchange semantics using QLI's returned scores in the Top-K modes.
+For the Top-K modes, graph replay must also overwrite the output buffer
+and match the full eager output on every rank, including rows outside the
+CPU sample.
 
 In each trace case directory, open the rank-specific Ascend profiler output
 in MindStudio Insight or load its trace timeline in a compatible viewer.

@@ -29,7 +29,12 @@ def parse_args():
     parser.add_argument("--queries-per-request", type=int, default=1, help="Causal query suffix size per request")
     parser.add_argument("--heads", type=int, choices=[32, 64], default=64, help="Replicated indexer heads per rank")
     parser.add_argument("--interleave", type=int, default=DEFAULT_INTERLEAVE, help="Global tokens per DCP stripe")
-    parser.add_argument("--input", choices=["qli", "synthetic"], default="qli", help="Run QLI or preload candidates")
+    parser.add_argument(
+        "--input",
+        choices=["qli", "synthetic", "collective"],
+        default="qli",
+        help="Run QLI, preload candidates, or measure only AllGather",
+    )
     parser.add_argument("--id-mode", choices=["owner-local", "global", "both"], default="both")
     parser.add_argument("--mode", choices=["eager", "graph", "both"], default="eager", help="Execution mode")
     parser.add_argument(
@@ -240,11 +245,9 @@ def hierarchical_topk(indices, scores, group, subgroups, interleave, *, return_l
 
 
 @contextmanager
-def profile_stages(group, subgroups):
+def profile_stages(group, subgroups, *, collective_only=False):
     """Annotate the production call chain for the trace run only."""
     import torch
-
-    from vllm_ascend.ops.triton import sharded_indexer as ops
 
     def annotate(fn, name):
         @wraps(fn)
@@ -255,20 +258,26 @@ def profile_stages(group, subgroups):
         return wrapped
 
     with ExitStack() as stack:
-        for attr, label in (
-            ("normalize_dcp_candidates", "normalize"),
-            ("pack_local_candidates", "sort_pack"),
-            ("merge_packed_candidates", "merge"),
-        ):
-            stack.enter_context(patch.object(ops, attr, annotate(getattr(ops, attr), label)))
+        if not collective_only:
+            from vllm_ascend.ops.triton import sharded_indexer as ops
+
+            for attr, label in (
+                ("normalize_dcp_candidates", "normalize"),
+                ("pack_local_candidates", "sort_pack"),
+                ("merge_packed_candidates", "merge"),
+            ):
+                stack.enter_context(patch.object(ops, attr, annotate(getattr(ops, attr), label)))
+            if subgroups is not None:
+                stack.enter_context(
+                    patch.dict(
+                        globals(), merge_hierarchical_candidates=annotate(merge_hierarchical_candidates, "merge")
+                    )
+                )
         if subgroups is None:
             stack.enter_context(patch.object(group, "all_gather", annotate(group.all_gather, "all_gather")))
         else:
             for subgroup, name in zip(subgroups, ("all_gather_intra", "all_gather_cross")):
                 stack.enter_context(patch.object(subgroup, "all_gather", annotate(subgroup.all_gather, name)))
-            stack.enter_context(
-                patch.dict(globals(), merge_hierarchical_candidates=annotate(merge_hierarchical_candidates, "merge"))
-            )
         yield
 
 
@@ -339,7 +348,9 @@ def trace_case(select, candidates, exchange, group, args, directory, *, replay=N
     dist.barrier(group=group.cpu_group)
     with (
         torch.inference_mode(),
-        profile_stages(group, subgroups) if replay is None else nullcontext(),
+        profile_stages(group, subgroups, collective_only=args.input == "collective")
+        if replay is None
+        else nullcontext(),
         profiler.profile(
             activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.NPU],
             experimental_config=profiler._ExperimentalConfig(profiler_level=profiler.ProfilerLevel.Level1),
@@ -361,7 +372,7 @@ def trace_case(select, candidates, exchange, group, args, directory, *, replay=N
     dist.barrier(group=group.cpu_group)
 
 
-def measure_case(args, group, subgroups, select, candidates, exchange, eager_output, report):
+def measure_case(args, group, subgroups, select, candidates, exchange, check_replay, report):
     import torch
 
     def invoke():
@@ -377,7 +388,7 @@ def measure_case(args, group, subgroups, select, candidates, exchange, eager_out
         with torch.inference_mode():
             graph_output.fill_(torch.iinfo(graph_output.dtype).min)
             graph.replay()
-        verify_output(torch.equal(graph_output.cpu(), eager_output), group, case + " graph replay")
+        verify_output(check_replay(graph_output), group, case + " graph replay")
         measurements.append(("graph", graph.replay, time_case(graph.replay, group, args)))
 
     for execution_mode, replay, latency in measurements:
@@ -400,6 +411,69 @@ def measure_case(args, group, subgroups, select, candidates, exchange, eager_out
             )
 
 
+def gather_only(packed, groups, tile):
+    for start in range(0, packed.shape[0], tile):
+        send = packed[start : start + tile]
+        gathered = groups[0].all_gather(send, dim=0)
+        if len(groups) == 2:
+            # Use the first member's tile as the second payload. All members
+            # see the same slice, and the second call consumes the first result.
+            gathered = groups[1].all_gather(gathered[: send.shape[0]], dim=0)
+    return gathered
+
+
+def run_collective_cases(args, group, device, subgroups, exchanges):
+    import torch
+
+    from vllm_ascend.attention.context_parallel.sharded_indexer import PACKED_PAIR_BYTES, gathered_candidate_row_tile
+
+    for rows in args.queries:
+        tile = gathered_candidate_row_tile(rows, WORLD_SIZE, TOPK)
+        last_start = (rows - 1) // tile * tile
+        last_rows = rows - last_start
+        payload = rows * TOPK * PACKED_PAIR_BYTES
+        row_ids = torch.arange(rows, dtype=torch.int32)
+        markers = torch.stack((row_ids, torch.full_like(row_ids, group.rank)), dim=-1)
+        packed = markers[:, None, :].expand(-1, TOPK, -1).contiguous().to(device)
+        for topology in exchanges:
+            grouped = topology == "hierarchical"
+            groups = subgroups if grouped else (group,)
+            group_sizes = [g.world_size for g in groups]
+            senders = (
+                [group.ranks[group.ranks.index(rank) // GROUP_SIZE * GROUP_SIZE] for rank in groups[-1].ranks]
+                if grouped
+                else group.ranks
+            )
+            expected_markers = torch.tensor(
+                [[(row, rank) for row in range(last_start, rows)] for rank in senders], dtype=torch.int32
+            )
+
+            def exchange(packed, groups=groups, tile=tile):
+                return gather_only(packed, groups, tile)
+
+            def check_output(output, expected=expected_markers, last_rows=last_rows):
+                markers = output.view(len(expected), last_rows, TOPK, 2)
+                # Check both ends of each sender's rows without copying the full receive buffer to CPU.
+                return torch.equal(markers[:, :, 0].cpu(), expected) and torch.equal(markers[:, :, -1].cpu(), expected)
+
+            case = f"collective-{topology}-q{rows}"
+            verify_output(check_output(exchange(packed)), group, case + " payload check")
+            report = {
+                "case": case,
+                "exchange": topology,
+                "input": args.input,
+                "queries": rows,
+                "topk": TOPK,
+                "world_size": WORLD_SIZE,
+                "warmup_steps": args.warmup,
+                "all_gather_group_sizes": group_sizes,
+                "all_gathers_per_step": math.ceil(rows / tile) * len(groups),
+                "packed_input_bytes_per_rank": payload,
+                "logical_recv_bytes_per_rank": payload * sum(size - 1 for size in group_sizes),
+            }
+            measure_case(args, group, subgroups if grouped else None, None, packed, exchange, check_output, report)
+
+
 def run_cases(args, group, device, device_operator, subgroups=None):
     import torch
 
@@ -409,8 +483,11 @@ def run_cases(args, group, device, device_operator, subgroups=None):
         gathered_candidate_row_tile,
     )
 
-    id_modes = ("owner-local", "global") if args.id_mode == "both" else (args.id_mode,)
     exchanges = ("flat", "hierarchical") if args.exchange == "both" else (args.exchange,)
+    if args.input == "collective":
+        run_collective_cases(args, group, device, subgroups, exchanges)
+        return
+    id_modes = ("owner-local", "global") if args.id_mode == "both" else (args.id_mode,)
     rank = group.rank_in_group
     for rows in args.queries:
         tile = gathered_candidate_row_tile(rows, WORLD_SIZE, TOPK)
@@ -473,8 +550,12 @@ def run_cases(args, group, device, device_operator, subgroups=None):
                         "logical_recv_bytes_per_rank": payload * sum(size - 1 for size in group_sizes),
                         "checked_rows": sample,
                     }
+
+                    def check_replay(output, eager_output=eager_output):
+                        return torch.equal(output.cpu(), eager_output)
+
                     measure_case(
-                        args, group, subgroups if grouped else None, select, candidates, exchange, eager_output, report
+                        args, group, subgroups if grouped else None, select, candidates, exchange, check_replay, report
                     )
             del select, candidates
 
