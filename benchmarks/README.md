@@ -269,12 +269,23 @@ contains this rank's globally selected winners, compacted and padded with
 `-1`. Global output contains the same globally ordered Top-K on every rank,
 with the coordinate system relevant to sparse KV offload.
 
+`--exchange flat` is the production baseline and the default. With
+`--exchange hierarchical`, the benchmark creates four contiguous four-rank
+groups in DCP rank order and four cross-groups of matching within-group
+positions. Each query tile runs an HCCL AllGather and exact Top-K merge
+within its group, then repeats across groups. The first merge retains
+global IDs and FP32 score bits. The second merge can emit global IDs or
+compact the winners owned by the current DCP rank into owner-local IDs.
+Both exchanges use the same tile boundaries and local packing. With
+`--exchange both`, the script checks the full hierarchical output against
+the flat baseline on every rank.
+
 The benchmark times eager candidate selection and exchange by default.
 `--mode graph` captures and replays the same path using ACL Graph, and
 `--mode both` measures eager and replay on the same fixed inputs. It
 prepares QLI metadata once per case and keeps input creation, validation,
 warmup, and graph capture outside the measured steps. The graph includes
-the real HCCL collective through the same vLLM DCP group. Model projections,
+the HCCL collectives for the selected exchange topology. Model projections,
 quantization, cache writes, main attention, and KV offload I/O are outside
 its scope.
 
@@ -311,16 +322,21 @@ torchrun --standalone --nproc-per-node=16 benchmarks/benchmark_dcp_indexer_topk.
 torchrun --standalone --nproc-per-node=16 benchmarks/benchmark_dcp_indexer_topk.py \
   --mode both --queries 12 --context-lengths 131072 --id-mode both
 
+# Compare flat and hierarchical exchanges on the same candidate inputs.
+torchrun --standalone --nproc-per-node=16 benchmarks/benchmark_dcp_indexer_topk.py \
+  --input synthetic --exchange both --queries 64 --context-lengths 131072 --id-mode both
+
 # Trace a single warmed ACL Graph replay of the global-ID path.
 torchrun --standalone --nproc-per-node=16 benchmarks/benchmark_dcp_indexer_topk.py \
   --mode graph --queries 12 --context-lengths 131072 --id-mode global \
   --profile-dir /tmp/dcp-indexer-graph-traces --profile-steps 1
 ```
 
-Graph mode also accepts `--input synthetic` to capture only the candidate
-exchange. All ranks capture and replay the same shape and collective sequence.
+Graph mode also accepts `--input synthetic` to capture only pack and exchange.
+All ranks capture and replay the same shape and collective sequence.
 Graph mode requires a CANN and torch_npu stack that supports HCCL capture for
-the chosen configuration. A capture or replay failure terminates the run.
+the chosen configuration, including both subgroup communicators for a
+hierarchical run. A capture or replay failure terminates the run.
 
 `--queries` and `--context-lengths` form a Cartesian sweep. Context length
 counts global tokens per request, including the current query suffix. Each
@@ -330,11 +346,14 @@ each. K history storage grows with request count and context length.
 
 ### Read the results
 
-Rank 0 prints one JSON line per case, ID mode, and `execution_mode`. Graph
-case names and trace directories end in `-graph`. Each line includes local contexts
-for all ranks, the number of collectives per step, and the packed input
-bytes per rank (INT32 ID plus FP32 score bits for each candidate). The byte
-count is the logical input size. Each sample is the maximum across ranks
+Rank 0 prints one JSON line per case, ID mode, `exchange`, and
+`execution_mode`. Hierarchical and graph cases add `-hierarchical` and
+`-graph` suffixes to their names and trace directories. Each line includes
+the subgroup sizes, number of collectives, and `logical_recv_bytes_per_rank`
+per step. At Q=64 this is 15 MiB for flat and 6 MiB for hierarchical.
+The estimate counts candidate bytes from peers, excluding the local
+contribution and HCCL protocol traffic. Synthetic timings include local
+sort/pack, AllGather, and merge. Each sample is the maximum across ranks
 of host elapsed time through device synchronization. The JSON reports the
 samples, p50, and p95. CPU barriers and warmup run outside this timing.
 
@@ -352,7 +371,9 @@ For eager, find `dcp_indexer.step`, `dcp_indexer.local_qli` (native QLI dispatch
 nested `dcp_indexer.normalize`), `dcp_indexer.sort_pack`,
 `dcp_indexer.all_gather`, and `dcp_indexer.merge`. Sort and pack share a
 scope because production can fuse them. Use the NPU and HCCL lanes for
-device durations and the CPU scopes to correlate dispatch. Graph profiling
+device durations and the CPU scopes to correlate dispatch. Hierarchical
+traces label the two collectives `dcp_indexer.all_gather_intra` and
+`dcp_indexer.all_gather_cross`. Graph profiling
 records `dcp_indexer.graph_replay` on the host. Visibility of individual
 device and HCCL tasks depends on the profiler and CANN versions. In
 `--mode both`, timing for both execution modes of an ID case runs before

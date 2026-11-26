@@ -13,6 +13,7 @@ from time import perf_counter_ns
 from unittest.mock import patch
 
 WORLD_SIZE = 16
+GROUP_SIZE = 4
 TOPK = 2048
 HEAD_DIM = 128
 PAGE_SIZE = 128
@@ -31,6 +32,9 @@ def parse_args():
     parser.add_argument("--input", choices=["qli", "synthetic"], default="qli", help="Run QLI or preload candidates")
     parser.add_argument("--id-mode", choices=["owner-local", "global", "both"], default="both")
     parser.add_argument("--mode", choices=["eager", "graph", "both"], default="eager", help="Execution mode")
+    parser.add_argument(
+        "--exchange", choices=["flat", "hierarchical", "both"], default="flat", help="Candidate exchange topology"
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--seed", type=int, default=7)
@@ -161,7 +165,82 @@ def reference_topk(indices, scores, args, rows, length, group):
 
 
 @contextmanager
-def profile_stages(group):
+def hierarchical_groups(group):
+    from vllm.distributed.parallel_state import init_model_parallel_group
+
+    ranks = group.ranks
+    intra_ranks = [ranks[start : start + GROUP_SIZE] for start in range(0, WORLD_SIZE, GROUP_SIZE)]
+    cross_ranks = [list(column) for column in zip(*intra_ranks)]
+    with ExitStack() as stack:
+        intra = init_model_parallel_group(intra_ranks, group.local_rank, "hccl", group_name="indexer_bench_intra")
+        stack.callback(intra.destroy)
+        cross = init_model_parallel_group(cross_ranks, group.local_rank, "hccl", group_name="indexer_bench_cross")
+        stack.callback(cross.destroy)
+        yield intra, cross
+
+
+def merge_hierarchical_candidates(gathered, output, interleave, *, keep_pairs=False, local_rank=-1):
+    from vllm_ascend.ops.triton.sharded_indexer import _merge_candidates
+    from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num, init_device_properties_triton
+
+    init_device_properties_triton()
+    rows = output.shape[0]
+    _merge_candidates[(min(rows, get_vectorcore_num()),)](
+        gathered,
+        output,
+        rows,
+        TOPK,
+        TOPK,
+        GROUP_SIZE,
+        local_rank,
+        interleave,
+        TOPK.bit_length() - 1,
+        True,
+        GROUP_SIZE=GROUP_SIZE if keep_pairs else 0,
+        OWNER_WORLD=WORLD_SIZE,
+        multibuffer=False,
+    )
+
+
+def hierarchical_topk(indices, scores, group, subgroups, interleave, *, return_local=False):
+    import torch
+
+    from vllm_ascend.attention.context_parallel.sharded_indexer import gathered_candidate_row_tile
+    from vllm_ascend.ops.triton.sharded_indexer import pack_local_candidates
+
+    intra, cross = subgroups
+    rows = indices.shape[0]
+    output = torch.empty((rows, 1, TOPK), dtype=torch.int32, device=indices.device)
+    if rows == 0:
+        return output
+    # Use identical query tile boundaries in the flat and hierarchical benchmarks.
+    tile = gathered_candidate_row_tile(rows, WORLD_SIZE, TOPK)
+    for start in range(0, rows, tile):
+        end = min(start + tile, rows)
+        packed = pack_local_candidates(
+            indices[start:end],
+            scores[start:end],
+            WORLD_SIZE,
+            group.rank_in_group,
+            interleave,
+            sort_candidates=True,
+            fuse_sort=return_local,
+        )
+        partial = torch.empty_like(packed)
+        merge_hierarchical_candidates(intra.all_gather(packed, dim=0), partial, interleave, keep_pairs=True)
+        # The partial already contains global IDs. The last merge uses all
+        # sixteen owners when it compacts the local winners.
+        merge_hierarchical_candidates(
+            cross.all_gather(partial, dim=0),
+            output[start:end],
+            interleave,
+            local_rank=group.rank_in_group if return_local else -1,
+        )
+    return output
+
+
+@contextmanager
+def profile_stages(group, subgroups):
     """Annotate the production call chain for the trace run only."""
     import torch
 
@@ -182,7 +261,14 @@ def profile_stages(group):
             ("merge_packed_candidates", "merge"),
         ):
             stack.enter_context(patch.object(ops, attr, annotate(getattr(ops, attr), label)))
-        stack.enter_context(patch.object(group, "all_gather", annotate(group.all_gather, "all_gather")))
+        if subgroups is None:
+            stack.enter_context(patch.object(group, "all_gather", annotate(group.all_gather, "all_gather")))
+        else:
+            for subgroup, name in zip(subgroups, ("all_gather_intra", "all_gather_cross")):
+                stack.enter_context(patch.object(subgroup, "all_gather", annotate(subgroup.all_gather, name)))
+            stack.enter_context(
+                patch.dict(globals(), merge_hierarchical_candidates=annotate(merge_hierarchical_candidates, "merge"))
+            )
         yield
 
 
@@ -244,7 +330,7 @@ def time_case(invoke, group, args):
     }
 
 
-def trace_case(select, candidates, exchange, group, args, directory, *, replay=None):
+def trace_case(select, candidates, exchange, group, args, directory, *, replay=None, subgroups=None):
     import torch
     import torch.distributed as dist
     import torch_npu
@@ -253,7 +339,7 @@ def trace_case(select, candidates, exchange, group, args, directory, *, replay=N
     dist.barrier(group=group.cpu_group)
     with (
         torch.inference_mode(),
-        profile_stages(group) if replay is None else nullcontext(),
+        profile_stages(group, subgroups) if replay is None else nullcontext(),
         profiler.profile(
             activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.NPU],
             experimental_config=profiler._ExperimentalConfig(profiler_level=profiler.ProfilerLevel.Level1),
@@ -275,7 +361,46 @@ def trace_case(select, candidates, exchange, group, args, directory, *, replay=N
     dist.barrier(group=group.cpu_group)
 
 
-def run_cases(args, group, device, device_operator):
+def measure_case(args, group, subgroups, select, candidates, exchange, eager_output, report):
+    import torch
+
+    def invoke():
+        return exchange(select() if select is not None else candidates)
+
+    case = report["case"]
+    measurements = []
+    if args.mode in ("eager", "both"):
+        measurements.append(("eager", None, time_case(invoke, group, args)))
+    if args.mode in ("graph", "both"):
+        graph, graph_output = capture_graph(invoke, group, args.warmup)
+        # Confirm replay writes the graph-owned output.
+        with torch.inference_mode():
+            graph_output.fill_(torch.iinfo(graph_output.dtype).min)
+            graph.replay()
+        verify_output(torch.equal(graph_output.cpu(), eager_output), group, case + " graph replay")
+        measurements.append(("graph", graph.replay, time_case(graph.replay, group, args)))
+
+    for execution_mode, replay, latency in measurements:
+        label = case if execution_mode == "eager" else case + "-graph"
+        directory = args.profile_dir / label if args.profile_dir is not None else None
+        if directory is not None:
+            trace_case(select, candidates, exchange, group, args, directory, replay=replay, subgroups=subgroups)
+        if group.rank_in_group == 0:
+            print(
+                json.dumps(
+                    {
+                        **report,
+                        "case": label,
+                        "execution_mode": execution_mode,
+                        "trace_dir": str(directory) if directory is not None else None,
+                        **latency,
+                    }
+                ),
+                flush=True,
+            )
+
+
+def run_cases(args, group, device, device_operator, subgroups=None):
     import torch
 
     from vllm_ascend.attention.context_parallel.sharded_indexer import (
@@ -284,9 +409,12 @@ def run_cases(args, group, device, device_operator):
         gathered_candidate_row_tile,
     )
 
-    modes = ("owner-local", "global") if args.id_mode == "both" else (args.id_mode,)
+    id_modes = ("owner-local", "global") if args.id_mode == "both" else (args.id_mode,)
+    exchanges = ("flat", "hierarchical") if args.exchange == "both" else (args.exchange,)
     rank = group.rank_in_group
     for rows in args.queries:
+        tile = gathered_candidate_row_tile(rows, WORLD_SIZE, TOPK)
+        payload = rows * TOPK * PACKED_PAIR_BYTES
         for length in args.context_lengths:
             select = None
             if args.input == "qli":
@@ -296,71 +424,58 @@ def run_cases(args, group, device, device_operator):
                 candidates = synthetic_candidates(args, rows, length, rank, device)
             sample, expected = reference_topk(*candidates, args, rows, length, group)
 
-            for mode in modes:
+            for mode in id_modes:
+                return_local = mode == "owner-local"
+                base = f"{args.input}-{mode}-q{rows}-kv{length}"
+                baseline = None
+                for topology in exchanges:
+                    grouped = topology == "hierarchical"
+                    case = base + "-hierarchical" if grouped else base
+                    if grouped:
 
-                def exchange(pair, mode=mode):
-                    return distributed_topk(*pair, group, TOPK, args.interleave, return_local=(mode == "owner-local"))
+                        def exchange(pair, return_local=return_local):
+                            return hierarchical_topk(
+                                *pair, group, subgroups, args.interleave, return_local=return_local
+                            )
 
-                def invoke(select=select, candidates=candidates, exchange=exchange):
-                    pair = select() if select is not None else candidates
-                    return exchange(pair)
+                    else:
 
-                case = f"{args.input}-{mode}-q{rows}-kv{length}"
-                eager_output = exchange(candidates).cpu()
-                verify_output(torch.equal(eager_output[sample, 0], expected[mode]), group, case + " CPU reference")
+                        def exchange(pair, return_local=return_local):
+                            return distributed_topk(*pair, group, TOPK, args.interleave, return_local=return_local)
 
-                measurements = []
-                if args.mode in ("eager", "both"):
-                    measurements.append(("eager", None, time_case(invoke, group, args)))
-                if args.mode in ("graph", "both"):
-                    graph, graph_output = capture_graph(invoke, group, args.warmup)
-                    # Poison the graph-owned output outside capture to check that
-                    # replay writes it rather than reading a stale capture result.
-                    with torch.inference_mode():
-                        graph_output.fill_(torch.iinfo(graph_output.dtype).min)
-                        graph.replay()
-                    verify_output(torch.equal(graph_output.cpu(), eager_output), group, case + " graph replay")
-                    measurements.append(("graph", graph.replay, time_case(graph.replay, group, args)))
+                    eager_output = exchange(candidates).cpu()
+                    verify_output(torch.equal(eager_output[sample, 0], expected[mode]), group, case + " CPU reference")
+                    if baseline is not None:
+                        verify_output(torch.equal(eager_output, baseline), group, case + " flat comparison")
+                    if topology == "flat":
+                        baseline = eager_output
 
-                tile = gathered_candidate_row_tile(rows, WORLD_SIZE, TOPK)
-                for execution_mode, replay, latency in measurements:
-                    label = case if execution_mode == "eager" else case + "-graph"
-                    directory = args.profile_dir / label if args.profile_dir is not None else None
-                    if directory is not None:
-                        trace_case(select, candidates, exchange, group, args, directory, replay=replay)
-                    if rank == 0:
-                        print(
-                            json.dumps(
-                                {
-                                    "case": label,
-                                    "execution_mode": execution_mode,
-                                    "input": args.input,
-                                    "id_mode": mode,
-                                    "queries": rows,
-                                    "queries_per_request": args.queries_per_request,
-                                    "global_context": length,
-                                    "local_context_by_rank": [
-                                        local_length(length, r, args.interleave) for r in range(WORLD_SIZE)
-                                    ],
-                                    "replicated_heads": args.heads,
-                                    "kernel_page_size": PAGE_SIZE,
-                                    "interleave": args.interleave,
-                                    "topk": TOPK,
-                                    "world_size": WORLD_SIZE,
-                                    "seed": args.seed,
-                                    "warmup_steps": args.warmup,
-                                    "all_gathers_per_step": math.ceil(rows / tile),
-                                    "packed_input_bytes_per_rank": rows * TOPK * PACKED_PAIR_BYTES,
-                                    "checked_rows": sample,
-                                    "trace_dir": str(directory) if directory is not None else None,
-                                    **latency,
-                                }
-                            ),
-                            flush=True,
-                        )
-                if args.mode in ("graph", "both"):
-                    del graph, graph_output, replay
-                del measurements, invoke
+                    group_sizes = (GROUP_SIZE, GROUP_SIZE) if grouped else (WORLD_SIZE,)
+                    report = {
+                        "case": case,
+                        "exchange": topology,
+                        "input": args.input,
+                        "id_mode": mode,
+                        "queries": rows,
+                        "queries_per_request": args.queries_per_request,
+                        "global_context": length,
+                        "local_context_by_rank": [local_length(length, r, args.interleave) for r in range(WORLD_SIZE)],
+                        "replicated_heads": args.heads,
+                        "kernel_page_size": PAGE_SIZE,
+                        "interleave": args.interleave,
+                        "topk": TOPK,
+                        "world_size": WORLD_SIZE,
+                        "seed": args.seed,
+                        "warmup_steps": args.warmup,
+                        "all_gather_group_sizes": group_sizes,
+                        "all_gathers_per_step": math.ceil(rows / tile) * len(group_sizes),
+                        "packed_input_bytes_per_rank": payload,
+                        "logical_recv_bytes_per_rank": payload * sum(size - 1 for size in group_sizes),
+                        "checked_rows": sample,
+                    }
+                    measure_case(
+                        args, group, subgroups if grouped else None, select, candidates, exchange, eager_output, report
+                    )
             del select, candidates
 
 
@@ -438,7 +553,9 @@ def main():
                 prefill_context_model_parallel_size=1,
                 backend="hccl",
             )
-            run_cases(args, get_dcp_group(), device, device_operator)
+            group = get_dcp_group()
+            with hierarchical_groups(group) if args.exchange != "flat" else nullcontext() as subgroups:
+                run_cases(args, group, device, device_operator, subgroups)
         finally:
             destroy_model_parallel()
             destroy_distributed_environment()
