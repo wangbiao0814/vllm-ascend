@@ -336,6 +336,11 @@ torchrun --standalone --nproc-per-node=16 benchmarks/benchmark_dcp_indexer_topk.
   --mode both --warmup 20 --iterations 100 \
   --profile-dir /tmp/dcp-q64-stage-traces --profile-steps 5
 
+# Run only cross group 0 (DCP ranks 0, 4, 8, 12).
+torchrun --standalone --nproc-per-node=16 benchmarks/benchmark_dcp_indexer_topk.py \
+  --input collective --exchange hierarchical --collective-stage cross \
+  --single-group-index 0 --queries 64 --mode both --warmup 20 --iterations 100
+
 # Trace a single warmed ACL Graph replay of the global-ID path.
 torchrun --standalone --nproc-per-node=16 benchmarks/benchmark_dcp_indexer_topk.py \
   --mode graph --queries 12 --context-lengths 131072 --id-mode global \
@@ -363,7 +368,16 @@ payload size without running a merge or copy between the calls.
 choose `intra` to run the first round alone or `cross` to run the second
 round alone on prebuilt input identical to that of the chained case.
 `all` runs both standalone cases and the chain. In each standalone case,
-all four subgroups for that round participate concurrently.
+all four subgroups for that round participate by default.
+Use `--single-group-index 0` through `3` with `--exchange hierarchical`
+and `--collective-stage intra` or `cross` to run one subgroup only.
+In DCP rank order, intra group index `i` selects `[4i, 4i+1, 4i+2, 4i+3]`
+and cross group index `i` selects `[i, i+4, i+8, i+12]`.
+All 16 ranks still launch so the communicators stay comparable. The
+other 12 ranks wait on a CPU barrier while the chosen four ranks run the
+test. This includes warmup, timing, graph capture, and profiling.
+The output field `timed_ranks` lists the ranks included in the latency
+statistic. A single-group trace uses the original global rank numbers.
 Results are independent of `--id-mode` and `--context-lengths`.
 Latency includes collective dispatch
 and the final device synchronization. The benchmark checks sampled
@@ -372,8 +386,8 @@ graph replay.
 
 ### Read the results
 
-Rank 0 prints one JSON line per case, ID mode, `exchange`, and
-`execution_mode`. Hierarchical and graph cases add `-hierarchical` and
+The first rank of the measurement group prints one JSON line per case,
+ID mode, `exchange`, and `execution_mode`. Hierarchical and graph cases add `-hierarchical` and
 `-graph` suffixes to their names and trace directories. Each line includes
 the subgroup sizes, number of collectives, and `logical_recv_bytes_per_rank`
 per step. At Q=64 this is 15 MiB for flat, 3 MiB for either standalone
