@@ -14,7 +14,12 @@ constexpr uint32_t SCALAR_HIT_RUNS = 64U;
 constexpr uint32_t REPORT_PROBE = 128U;
 constexpr uint32_t FINISH_COUNT_ONLY = 256U;
 constexpr uint32_t FINISH_CHECK_ONLY = 512U;
-constexpr uint32_t DIAGNOSTIC_MASK = 1023U;
+constexpr uint32_t VECTOR_HIT_RUNS = 1024U;
+constexpr uint32_t RANGE_HIT_CLEAR = 2048U;
+constexpr uint32_t MERGED_AGE_UPDATE = 4096U;
+constexpr uint32_t MERGED_INCOMPATIBLE = SKIP_HIT_CLEAR | SKIP_INCREMENT | HIT_BUCKETS_ONLY |
+    SKIP_LOCAL_HIT_CLEAR | HIT_SORT_ONLY;
+constexpr uint32_t DIAGNOSTIC_MASK = 8191U;
 // Reserved tail cells are written only in untimed diagnostic calls.
 constexpr uint32_t PROBE_WORDS = 16U;
 constexpr int32_t PROBE_MAGIC = 0x4c494d41;
@@ -23,6 +28,13 @@ constexpr uint32_t TILE = 512U;
 constexpr uint32_t AGE_INPUT = 13U;
 constexpr uint32_t AGE_OUTPUT = 7U;
 constexpr uint32_t OUTPUT_COUNT = 8U;
+#if defined(__CCE_AICORE__)
+__aicore__
+#endif
+inline constexpr bool ValidDiagnostic(uint32_t flags) {
+    return flags <= DIAGNOSTIC_MASK &&
+        ((flags & MERGED_AGE_UPDATE) == 0U || (flags & MERGED_INCOMPATIBLE) == 0U);
+}
 #if defined(__CCE_AICORE__)
 __aicore__
 #endif

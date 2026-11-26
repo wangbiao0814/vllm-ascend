@@ -225,7 +225,7 @@ def test_age_diagnostic_flags_control_state_updates(flags):
     _assert_resident_bijection(cache[row].cpu(), prefix, case.cache_tokens[0])
 
 
-@pytest.mark.parametrize("flags", [-1, 1024])
+@pytest.mark.parametrize("flags", [-1, 8192, 4097, 4098, 4104, 4112, 4128])
 @torch.inference_mode()
 def test_age_rejects_invalid_diagnostic_flags(flags):
     case = _build_case(q_values=[1], states=[-1], offload_len=8192, cache_tokens=4096)
@@ -258,7 +258,7 @@ def test_age_buffered_hit_clear_all_hit_partial_block():
 def test_age_vector_and_scalar_grouping_match(length):
     case = _build_case(q_values=[1], states=[-1], offload_len=length, cache_tokens=4096)
     results = []
-    for flags in (0, 64):
+    for flags in (0, 64, 1024, 2048, 6144):
         cache = case.cache_seed.clone()
         ages = torch.arange(cache.shape[1], dtype=torch.int32, device="npu").expand_as(cache).contiguous()
         outputs = _make_outputs(case)
@@ -266,14 +266,15 @@ def test_age_vector_and_scalar_grouping_match(length):
         call_age(case, cache, ages, outputs, 4, diagnostic_flags=flags)
         check_age_step(case, cache, ages, outputs, before_cache, before_ages, 4)
         results.append((cache.cpu(), ages.cpu(), [tensor.cpu() for tensor in outputs]))
-    assert torch.equal(results[0][0], results[1][0])
-    assert torch.equal(results[0][1], results[1][1])
-    left, right = results[0][2], results[1][2]
-    for index in (0, 1, 2, 5):
-        assert torch.equal(left[index], right[index])
-    count = int(left[5][0])
-    for index in (3, 4):
-        assert torch.equal(left[index][0, :count], right[index][0, :count])
+    for candidate in results[1:]:
+        assert torch.equal(results[0][0], candidate[0])
+        assert torch.equal(results[0][1], candidate[1])
+        left, right = results[0][2], candidate[2]
+        for index in (0, 1, 2, 5):
+            assert torch.equal(left[index], right[index])
+        count = int(left[5][0])
+        for index in (3, 4):
+            assert torch.equal(left[index][0, :count], right[index][0, :count])
 
 
 @pytest.mark.parametrize("flags,phase", [(0, 3), (64, 3), (4, 0), (256, 2), (512, 1)])
@@ -304,7 +305,7 @@ def test_age_probe_preserves_valid_outputs_and_reports_stages(flags, phase):
     assert probe["effective_runs"] == torch.unique(hits // 512).numel()
     assert probe["finish_phase"] == phase
     assert probe["finish_count"] == (count if phase >= 2 else -1)
-    if flags & 64:
+    if not flags & 1024 or flags & 64:
         assert probe["path"] == "scalar" and probe["raw_block_count"] == -1
     elif probe["fallback_count"]:
         assert probe["path"] == "scalar_fallback"
@@ -312,3 +313,22 @@ def test_age_probe_preserves_valid_outputs_and_reports_stages(flags, phase):
         assert probe["path"] == "vector"
         assert probe["raw_block_count"] == probe["raw_start_count"] == probe["raw_end_count"]
         assert probe["raw_block_count"] == probe["effective_runs"]
+
+
+@pytest.mark.parametrize("flags", [0, 2048, 6144])
+@torch.inference_mode()
+def test_age_update_variants_repeated_graph(flags):
+    case = _build_case(q_values=[1], states=[-1], offload_len=8320, cache_tokens=4096)
+    cache = case.cache_seed.clone()
+    ages = torch.full_like(cache, AGE_MAX - 1)
+    outputs = _make_outputs(case)
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        call_age(case, cache, ages, outputs, 4, diagnostic_flags=flags)
+    torch.npu.synchronize()
+    cache.copy_(case.cache_seed)
+    ages.fill_(AGE_MAX - 1)
+    for _ in range(3):
+        before_cache, before_ages = cache.cpu(), ages.cpu()
+        graph.replay()
+        check_age_step(case, cache, ages, outputs, before_cache, before_ages, 4)

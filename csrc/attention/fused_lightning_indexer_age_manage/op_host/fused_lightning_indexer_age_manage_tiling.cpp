@@ -358,8 +358,9 @@ ge::graphStatus FusedLightningIndexerAgeManageTiling::DoTiling(FusedLightningInd
                OPS_LOG_E(tilingInfo->opName, "Age LIM requires T=B, matching int32 ages, and valid probation_age."),
                return ge::GRAPH_FAILED);
     const auto *diagnostic = attrs->GetAttrPointer<int64_t>(1);
-    OPS_ERR_IF(diagnostic == nullptr || *diagnostic < 0 || *diagnostic > LIMAge::DIAGNOSTIC_MASK,
-               OPS_LOG_E(tilingInfo->opName, "diagnostic_flags must be in [0,1023]."),
+    OPS_ERR_IF(diagnostic == nullptr || *diagnostic < 0 || *diagnostic > LIMAge::DIAGNOSTIC_MASK ||
+                   !LIMAge::ValidDiagnostic(static_cast<uint32_t>(*diagnostic)),
+               OPS_LOG_E(tilingInfo->opName, "diagnostic_flags must be in [0,8191]; merged updates require complete increment/Hit clear."),
                return ge::GRAPH_FAILED);
     tilingData_.set_diagnosticFlags(static_cast<uint32_t>(*diagnostic));
     tilingData_.set_probationAge(static_cast<uint32_t>(*probation));

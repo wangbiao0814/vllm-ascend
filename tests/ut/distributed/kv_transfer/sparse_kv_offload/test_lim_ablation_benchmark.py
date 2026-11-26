@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from benchmarks.benchmark_lim_age import (
     ABLATIONS,
+    AGE_UPDATE_BREAKDOWN,
     FINISH_BREAKDOWN,
     HIT_CLEAR_BREAKDOWN,
     HIT_GROUP_BREAKDOWN,
@@ -86,6 +87,12 @@ class TestDiagnosticSpec(unittest.TestCase):
         for invalid in ([0] * 16, words[:-1], [PROBE_MAGIC, 2] + words[2:]):
             with self.assertRaisesRegex(RuntimeError, "rebuild"):
                 decode_probe(invalid)
+
+    def test_age_update_breakdown_preserves_full_policy(self):
+        self.assertEqual([ABLATIONS[name] for name in AGE_UPDATE_BREAKDOWN], [0, 2048, 6144, 1024])
+        for name in AGE_UPDATE_BREAKDOWN:
+            with patch("sys.argv", ["bench", "--ablation", name, "--dry-run"]):
+                self.assertEqual(parse_args().ablation, name)
 
     def test_all_hit_and_all_miss_residency(self):
         for capacity in (TOPK, 8192):

@@ -325,7 +325,7 @@ __aicore__ inline void LIVector<LIT>::PrepareChunkPayload(
 
 #ifdef LIM_AGE_POLICY
     // Q=1: both AIVs prepare payloads, but only the even AIV owns age writes.
-    if ((diagnosticFlags_ & LIMAge::SKIP_INCREMENT) == 0U && (blockId_ & 1U) == 0U &&
+    if ((diagnosticFlags_ & (LIMAge::SKIP_INCREMENT | LIMAge::MERGED_AGE_UPDATE)) == 0U && (blockId_ & 1U) == 0U &&
         requestStateGm.GetValue(batchIdx) == LIMConfig::REQUEST_STATE_STEADY) {
         LocalTensor<int32_t> age = reduceOutBuf_.Get<int32_t>();
         LocalTensor<float> value = reduceOutBuf_.Get<float>()[s2BaseSize_];

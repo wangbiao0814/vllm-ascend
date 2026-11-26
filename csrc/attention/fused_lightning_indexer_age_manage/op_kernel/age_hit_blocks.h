@@ -75,6 +75,23 @@ LIM_AGE_INLINE void ClearSortedHitRun(uint32_t begin, uint32_t end,
         ages.SetValue(offset, 0);
     }
 }
+// Emit only truly consecutive offsets. Gaps must retain their ages.
+template <typename Sources, typename Clear>
+LIM_AGE_INLINE void ClearConsecutiveHitRanges(uint32_t begin, uint32_t end,
+                                             Sources &sources, Clear clear)
+{
+    if (begin == end) return;
+    uint32_t high = static_cast<uint32_t>(sources.GetValue(begin)) % HIT_BLOCK_SIZE;
+    uint32_t low = high;
+    for (uint32_t i = begin + 1U; i < end; ++i) {
+        const uint32_t offset = static_cast<uint32_t>(sources.GetValue(i)) % HIT_BLOCK_SIZE;
+        if (offset == low) continue; // duplicate Hit
+        if (offset + 1U == low) { low = offset; continue; }
+        clear(low, high + 1U);
+        low = high = offset;
+    }
+    clear(low, high + 1U);
+}
 #undef LIM_AGE_INLINE
 } // namespace LIMAge
 #endif

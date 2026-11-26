@@ -446,3 +446,42 @@ entirely disabled: `timed_calls=0`, timing values are null and
 `timing_scope=not_measured`. Profiler overhead must not be compared to the regular
 benchmark Event intervals. Share the JSON and the exported CSV/trace files for
 further attribution; JSON timing fields alone cannot resolve device stalls.
+
+## Age update optimization comparison
+
+Rebuild the age extension/kernel. Default grouping now uses the scalar run
+builder. The previous vector builder remains available with mask 1024;
+mask 64 explicitly selects scalar grouping and takes precedence over 1024.
+The diagnostic mask range is now [0,8191].
+
+```bash
+python -m benchmarks.benchmark_lim_age --scenario all-hit \
+  --ablation age-update-breakdown --mode eager --steps 32 \
+  --repeats 30 --latency-samples 8 --output lim_age_update_comparison.json
+```
+
+The score baseline is followed by these full-policy variants:
+
+| Variant | Flags | Age update |
+| --- | --- | --- |
+| `normal` | 0 | Scalar grouping, original local scalar clears and scan increment |
+| `range-hit-clear` | 2048 | Scalar grouping; clear truly consecutive Hits with aligned vector interiors |
+| `merged-age-update` | 6144 | Defer increment until final TopK; increment and clear in one block pass |
+| `vector-hit-runs` | 1024 | Previous vector grouping, original scalar clears and scan increment |
+
+Range clear uses scalar edges and 32-byte-aligned vector interiors. Gaps between
+Hits are preserved. Merged mode disables scan-time increment, then walks the
+entire valid history before eviction, using the old map to distinguish resident
+entries. It increments resident ages with saturation, zeros nonresident ages,
+overrides actual Hits to zero, and writes each block once. All-miss still updates
+all blocks; first-fill initialization and final Miss P assignment are unchanged.
+No reverse map or persistent state is added. The merged pass uses existing UB
+scratch. It may lose scan/computation overlap, so speedup requires measurement.
+
+Merged mode cannot combine with skip-increment, skip-Hit-clear, grouping-only,
+copy-only or sort-only flags; the binding and tiler reject these combinations.
+Other diagnostic bits retain their meaning. Historical breakdowns without mask
+1024 now use scalar grouping. Use the explicit variants above for scalar/vector
+comparisons. Add `--diagnostics --profile-dir lim_age_update_profiles` for an
+untimed profiler pass; report actual kernel durations separately from Event times.
+CPU helper/model checks do not establish CANN compatibility or NPU performance.

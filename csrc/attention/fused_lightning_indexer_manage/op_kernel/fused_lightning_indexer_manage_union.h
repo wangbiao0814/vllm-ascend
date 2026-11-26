@@ -274,10 +274,68 @@ private:
         return local.GetValue(0);
     }
 
-    __aicore__ inline void ClearAgeHits(uint32_t query, uint32_t row) {
+    // Run before eviction: the map still describes the old residents.
+    // Reuse dead sort scratch; no persistent map or additional UB allocation.
+    __aicore__ inline void UpdateAllAgeBlocks(uint32_t row, uint32_t length, uint32_t runs) {
+        LocalTensor<int32_t> sources = occurrenceBuf.Get<uint32_t>().ReinterpretCast<int32_t>();
+        LocalTensor<int32_t> blocks = unionSourceBuf.Get<int32_t>();
+        LocalTensor<int32_t> starts = blocks[TOPK], ends = blocks[2U * TOPK];
+        LocalTensor<int32_t> tile = pairOutBuf.Get<int32_t>();
+        LocalTensor<int32_t> slots = tile[LIMAge::TILE];
+        LocalTensor<float> value = tile[2U * LIMAge::TILE].ReinterpretCast<float>();
+        LocalTensor<uint32_t> sign = tile[3U * LIMAge::TILE].ReinterpretCast<uint32_t>();
+        LocalTensor<uint8_t> mask = tile[4U * LIMAge::TILE].ReinterpretCast<uint8_t>();
+        const uint64_t base = static_cast<uint64_t>(row) * sourceCapacity;
+        uint32_t run = 0U;
+        for (uint32_t remaining = length; remaining != 0U;) {
+            const uint32_t start = ((remaining - 1U) / LIMAge::TILE) * LIMAge::TILE;
+            const uint32_t count = remaining - start;
+            const AscendC::DataCopyExtParams copy{1, count * sizeof(int32_t), 0, 0, 0};
+            DataCopyPad(tile, agesGm_[base + start], copy,
+                        AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
+            DataCopyPad(slots, cacheSlotsGm[base + start], copy,
+                        AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
+            Sync<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+            Cast(value, tile, RoundMode::CAST_NONE, count);
+            PipeBarrier<PIPE_V>();
+            Maxs(value, value, 0.0F, count);
+            PipeBarrier<PIPE_V>();
+            Mins(value, value, static_cast<float>(LIMAge::MAX_AGE - 1), count);
+            PipeBarrier<PIPE_V>();
+            Adds(value, value, 1.0F, count);
+            ShiftRight(sign, slots.ReinterpretCast<uint32_t>(), 31U, count);
+            PipeBarrier<PIPE_V>();
+            CompareScalar(mask, sign.ReinterpretCast<int32_t>(), 0, CMPMODE::EQ, count);
+            PipeBarrier<PIPE_V>();
+            LocalTensor<float> zero = sign.ReinterpretCast<float>();
+            Duplicate(zero, 0.0F, count);
+            PipeBarrier<PIPE_V>();
+            Select(value, mask, value, zero, SELMODE::VSEL_TENSOR_TENSOR_MODE, count);
+            PipeBarrier<PIPE_V>();
+            Cast(tile, value, RoundMode::CAST_RINT, count);
+            Sync<HardEvent::V_S>(HardEvent::V_S);
+            if (run < runs && static_cast<uint32_t>(blocks.GetValue(run)) == start / LIMAge::TILE) {
+                const uint32_t begin = static_cast<uint32_t>(starts.GetValue(run));
+                const uint32_t end = static_cast<uint32_t>(ends.GetValue(run));
+                LIMAge::ClearConsecutiveHitRanges(begin, end, sources, LIMAge::ClearAgeRange{tile});
+                ++run;
+            }
+            Sync<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+            Sync<HardEvent::V_MTE3>(HardEvent::V_MTE3);
+            DataCopyPad(agesGm_[base + start], tile, copy);
+            Sync<HardEvent::MTE3_S>(HardEvent::MTE3_S);
+            Sync<HardEvent::MTE3_V>(HardEvent::MTE3_V);
+            remaining = start;
+        }
+        Sync<HardEvent::S_V>(HardEvent::S_V);
+    }
+
+    __aicore__ inline void ClearAgeHits(uint32_t query, uint32_t row, uint32_t length) {
         const int32_t misses = LoadAgeCount(routeMissCountsGm, static_cast<uint64_t>(query) * ROUTE_COUNT_STRIDE);
         if (misses < 0 || misses >= static_cast<int32_t>(TOPK)) {
             if ((diagnosticFlags_ & LIMAge::REPORT_PROBE) != 0U) ageProbe_[7] = 7;
+            if ((diagnosticFlags_ & LIMAge::MERGED_AGE_UPDATE) != 0U)
+                UpdateAllAgeBlocks(row, length, 0U);
             return;
         }
         static_assert(3U * TOPK <= CAPACITY, "Hit run metadata must fit unionSourceBuf");
@@ -317,7 +375,8 @@ private:
         // Sort scratch is dead after ExtractIndex; reuse its first tile.
         LocalTensor<int32_t> ageTile = pairOutBuf.Get<int32_t>();
         uint32_t touchedCount = 0U;
-        if ((diagnosticFlags_ & LIMAge::SCALAR_HIT_RUNS) != 0U) {
+        if ((diagnosticFlags_ & LIMAge::VECTOR_HIT_RUNS) == 0U ||
+            (diagnosticFlags_ & LIMAge::SCALAR_HIT_RUNS) != 0U) {
             if ((diagnosticFlags_ & LIMAge::REPORT_PROBE) != 0U) ageProbe_[7] = 2;
             touchedCount = LIMAge::BuildSortedHitRuns(
                 sources, TOPK, sourceCapacity, touched, starts, ends);
@@ -355,6 +414,10 @@ private:
             Sync<HardEvent::S_V>(HardEvent::S_V);
             return;
         }
+        if ((diagnosticFlags_ & LIMAge::MERGED_AGE_UPDATE) != 0U) {
+            UpdateAllAgeBlocks(row, length, touchedCount);
+            return;
+        }
         const uint64_t base = static_cast<uint64_t>(row) * sourceCapacity;
         for (uint32_t i = 0U; i < touchedCount; ++i) {
             const uint32_t block = static_cast<uint32_t>(touched.GetValue(i));
@@ -364,9 +427,16 @@ private:
             DataCopyPad(ageTile, agesGm_[base + start], copy,
                         AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
             Sync<HardEvent::MTE2_S>(HardEvent::MTE2_S);
-            if ((diagnosticFlags_ & LIMAge::SKIP_LOCAL_HIT_CLEAR) == 0U)
-                LIMAge::ClearSortedHitRun(static_cast<uint32_t>(starts.GetValue(i)),
-                                          static_cast<uint32_t>(ends.GetValue(i)), sources, ageTile);
+            if ((diagnosticFlags_ & LIMAge::SKIP_LOCAL_HIT_CLEAR) == 0U) {
+                const uint32_t begin = static_cast<uint32_t>(starts.GetValue(i));
+                const uint32_t end = static_cast<uint32_t>(ends.GetValue(i));
+                if ((diagnosticFlags_ & LIMAge::RANGE_HIT_CLEAR) != 0U)
+                    LIMAge::ClearConsecutiveHitRanges(begin, end, sources, LIMAge::ClearAgeRange{ageTile});
+                else
+                    LIMAge::ClearSortedHitRun(begin, end, sources, ageTile);
+            }
+            if ((diagnosticFlags_ & LIMAge::RANGE_HIT_CLEAR) != 0U)
+                Sync<HardEvent::V_MTE3>(HardEvent::V_MTE3);
             Sync<HardEvent::S_MTE3>(HardEvent::S_MTE3);
             DataCopyPad(agesGm_[base + start], ageTile, copy);
             // Complete DMA before the next tile reuses ageTile and before
@@ -2750,7 +2820,7 @@ private:
             return;
         }
         if ((diagnosticFlags_ & LIMAge::SKIP_HIT_CLEAR) == 0U)
-            ClearAgeHits(queryStart, static_cast<uint32_t>(ageRow));
+            ClearAgeHits(queryStart, static_cast<uint32_t>(ageRow), ageLength);
 #endif
         // Preserve the stable optimized MTP3 implementation when its score
         // and route workspace layout is identical to the legacy branch.

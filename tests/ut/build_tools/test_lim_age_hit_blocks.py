@@ -76,7 +76,10 @@ void check(uint32_t capacity, uint32_t misses, std::mt19937 &rng) {
         uint32_t n=std::min(512U,capacity-start);
         Tensor tile{std::vector<int32_t>(512,-777)};
         std::copy_n(ages.begin()+start,n,tile.data.begin());
-        LIMAge::ClearSortedHitRun(first,last,sources,tile);
+        LIMAge::ClearConsecutiveHitRanges(first,last,sources,[&](uint32_t low,uint32_t high) {
+            assert(low<high && high<=n);
+            for (uint32_t offset=low;offset<high;++offset) tile.SetValue(offset,0);
+        });
         assert(std::all_of(tile.data.begin()+n,tile.data.end(),[](int x){return x==-777;}));
         std::copy_n(tile.data.begin(),n,ages.begin()+start);
     }

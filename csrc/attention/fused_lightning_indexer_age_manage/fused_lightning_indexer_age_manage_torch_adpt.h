@@ -27,8 +27,9 @@ inline void npu_fused_lightning_indexer_age_manage(
               "source_ages_pool must match cache_slots_pool and be contiguous int32 on NPU.");
   TORCH_CHECK(probation_age >= 0 && probation_age <= LIMAge::MAX_AGE,
               "probation_age exceeds the supported age range.");
-  TORCH_CHECK(diagnostic_flags >= 0 && diagnostic_flags <= LIMAge::DIAGNOSTIC_MASK,
-              "diagnostic_flags must be in [0,1023]; nonzero is for ablation only.");
+  TORCH_CHECK(diagnostic_flags >= 0 && diagnostic_flags <= LIMAge::DIAGNOSTIC_MASK &&
+              LIMAge::ValidDiagnostic(static_cast<uint32_t>(diagnostic_flags)),
+              "diagnostic_flags must be in [0,8191]; merged updates cannot combine with skip increment/Hit clear or partial Hit stages.");
   constexpr int64_t kTopK = LIMConfig::TOPK;
   constexpr int64_t kMissCapacity = LIMConfig::MISS_CAPACITY;
   constexpr int64_t kBlockSize = LIMConfig::CACHE_BLOCK_SIZE;

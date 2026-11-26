@@ -5,6 +5,21 @@
 #include "age_hit_blocks.h"
 
 namespace LIMAge {
+struct ClearAgeRange {
+    AscendC::LocalTensor<int32_t> tile;
+    __aicore__ inline void operator()(uint32_t begin, uint32_t end) {
+        using namespace AscendC;
+        while (begin < end && (begin & 7U) != 0U) tile.SetValue(begin++, 0);
+        const uint32_t vectorEnd = end & ~7U;
+        if (begin < vectorEnd) {
+            AscendC::Duplicate(tile[begin], 0, vectorEnd - begin);
+            AscendC::PipeBarrier<PIPE_V>();
+            begin = vectorEnd;
+        }
+        while (begin < end) tile.SetValue(begin++, 0);
+    }
+};
+
 constexpr uint32_t HIT_BLOCK_SHIFT = 9U;
 constexpr uint32_t HIT_RUN_ALIGN_WORDS = 64U; // 256-byte compare-mask alignment
 constexpr uint32_t HIT_RUN_SENTINEL_WORDS = 8U; // 32-byte vector operand alignment

@@ -28,6 +28,15 @@ struct Storage {
 };
 int main() {
     std::mt19937 rng(7);
+    for (uint32_t begin=0;begin<512;++begin) {
+        for (uint32_t end=begin;end<=512;end+=7) {
+            Storage tile(512);
+            auto t=tile.view<int32_t>();
+            for (uint32_t i=0;i<512;++i) t.SetValue(i,17);
+            LIMAge::ClearAgeRange{t}(begin,end);
+            for (uint32_t i=0;i<512;++i) assert(t.GetValue(i)==(i>=begin && i<end ? 0 : 17));
+        }
+    }
     for (uint32_t n: {64U,128U,2048U})
     for (uint32_t cap: {1U,128U,512U,8320U,8448U,131200U,2097152U})
     for (uint32_t mode=0;mode<5;++mode) {

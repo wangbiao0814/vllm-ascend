@@ -125,3 +125,13 @@ masks intentionally omit P assignment. The benchmark provides `finish-breakdown`
 `--diagnostics` and `--profile-dir` to separate checks/count reads, verify fallback
 and collect actual NPU kernel timelines. See the benchmark guide for commands and
 the output-tail layout. Instrumented runs do not report Event latency.
+
+The default now uses scalar run grouping. Mask 1024 restores vector grouping;
+64 forces scalar grouping. Mask 2048 clears consecutive Hit ranges using aligned
+vector interiors and scalar edges. Mask 4096 moves resident increment after TopK
+and merges it with Hit clear in a full block pass before eviction. The merged
+pass also uses range clear, even without 2048. It reuses existing UB scratch and
+requires complete increment/Hit-clear stages (no bits 1,2,8,16,32). Mask range is
+[0,8191]. Benchmark `age-update-breakdown` compares the three optimization steps
+and the former vector path. NPU compilation, correctness and speedup await server
+validation.

@@ -35,12 +35,16 @@ FINISH_BREAKDOWN = (
     "scalar-finish-check-only",
     "scalar-finish-count-only",
 )
+AGE_UPDATE_BREAKDOWN = ("normal", "range-hit-clear", "merged-age-update", "vector-hit-runs")
 PROBE_WORDS = 16
 PROBE_MAGIC = 0x4C494D41
 REPORT_PROBE = 128
 
 ABLATIONS = {
     "normal": 0,
+    "range-hit-clear": 2048,
+    "merged-age-update": 6144,
+    "vector-hit-runs": 1024,
     "no-hit-clear": 1,
     "no-increment": 2,
     "no-increment-or-hit-clear": 3,
@@ -68,7 +72,14 @@ def parse_args():
     parser.add_argument("--scenario", choices=["trace", "all-hit", "all-miss"], default="trace")
     parser.add_argument(
         "--ablation",
-        choices=[*ABLATIONS, "all", "hit-clear-breakdown", "hit-group-breakdown", "finish-breakdown"],
+        choices=[
+            *ABLATIONS,
+            "all",
+            "hit-clear-breakdown",
+            "hit-group-breakdown",
+            "finish-breakdown",
+            "age-update-breakdown",
+        ],
         default="normal",
     )
     parser.add_argument("--length", type=int, default=16384)
@@ -93,7 +104,10 @@ def parse_args():
         parser.error("Require 2048 <= capacity <= min(length, 32640)")
     if args.scenario == "all-miss" and args.length < args.capacity + TOPK:
         parser.error("all-miss requires length >= capacity + 2048")
-    if args.ablation not in ("normal", "scalar-hit-runs") and args.scenario == "trace":
+    if (
+        args.ablation not in ("normal", "scalar-hit-runs", "range-hit-clear", "merged-age-update", "vector-hit-runs")
+        and args.scenario == "trace"
+    ):
         parser.error("Diagnostic ablations require all-hit or all-miss; they do not preserve the age policy")
     if args.length % 128 or args.capacity % 128:
         parser.error("length and capacity must be 128-aligned")
@@ -246,7 +260,9 @@ def run(args, spec):
     results = []
     selections = {}
     with torch.inference_mode():
-        if args.ablation == "finish-breakdown":
+        if args.ablation == "age-update-breakdown":
+            names = AGE_UPDATE_BREAKDOWN
+        elif args.ablation == "finish-breakdown":
             names = FINISH_BREAKDOWN
         elif args.ablation == "hit-group-breakdown":
             names = HIT_GROUP_BREAKDOWN
@@ -360,7 +376,7 @@ def run(args, spec):
                     "policy": policy,
                     "ablation": ablation,
                     "diagnostic_flags": flags,
-                    "policy_valid": (flags & ~64) == 0,
+                    "policy_valid": (flags & ~(64 | 1024 | 2048 | 4096)) == 0,
                     "hits": accesses - sum(misses),
                     "misses": sum(misses),
                     "accesses": accesses,
