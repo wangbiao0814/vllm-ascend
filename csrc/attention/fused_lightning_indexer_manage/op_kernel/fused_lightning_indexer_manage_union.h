@@ -290,7 +290,7 @@ private:
         for (uint32_t remaining = length; remaining != 0U;) {
             const uint32_t start = ((remaining - 1U) / LIMAge::TILE) * LIMAge::TILE;
             const uint32_t count = remaining - start;
-            const AscendC::DataCopyExtParams copy{1, count * sizeof(int32_t), 0, 0, 0};
+            const AscendC::DataCopyExtParams copy{1, static_cast<uint32_t>(count * sizeof(int32_t)), 0, 0, 0};
             DataCopyPad(tile, agesGm_[base + start], copy,
                         AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
             DataCopyPad(slots, cacheSlotsGm[base + start], copy,
