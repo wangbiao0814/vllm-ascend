@@ -490,6 +490,12 @@ class ExpertOffloadConfig:
 
 
 @config
+class HiSparseEvictionConfig:
+    policy: Literal["lru", "reuse_prioritized_lru"] = "lru"
+    probation_age: int = Field(default=4, ge=0, le=32767, strict=True)
+
+
+@config
 class AscendConfig:
     """Configuration Object for additional_config from vllm.configs.
 
@@ -725,6 +731,7 @@ class AscendConfig:
     xlite_graph_config: XliteGraphConfig = dataclasses.field(default_factory=lambda: XliteGraphConfig())
     finegrained_tp_config: FinegrainedTPConfig = dataclasses.field(default_factory=lambda: FinegrainedTPConfig())
     scheduler_config: SchedulerConfig = dataclasses.field(default_factory=lambda: SchedulerConfig())
+    hisparse_eviction_config: HiSparseEvictionConfig = dataclasses.field(default_factory=HiSparseEvictionConfig)
     # Still factory-injected: construction depends on vllm_config.
     sparse_kv_offload_config: Any = dataclasses.field(kw_only=True)
     kvpp_config: KVPPConfig = dataclasses.field(default_factory=KVPPConfig, kw_only=True)
@@ -791,6 +798,11 @@ class AscendConfig:
         from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
 
         vc = vllm_config
+        if (
+            self.hisparse_eviction_config.policy == "reuse_prioritized_lru"
+            and getattr(getattr(vc, "attention_config", None), "hisparse_config", None) is None
+        ):
+            raise ValueError("HiSparse reuse-prioritized LRU requires attention_config.hisparse_config")
         validate_expert_offload_config(self.expert_offload_config, vc, self)
         if self.shared_engram is not None and self.shared_engram.backend in ("a2", "a5"):
             if getattr(vc, "shutdown_timeout", 0) <= 0:

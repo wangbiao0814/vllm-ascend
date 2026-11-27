@@ -2947,11 +2947,12 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
             "Tensor(a!) resolved, Tensor(a!) errors, Tensor(a!)? attention, Tensor(a!)? counts, "
             "Tensor(a!)? swap_host, Tensor(a!)? swap_device, Tensor(a!)? swap_counts, Tensor(a!)? miss_mask, "
             "Tensor(a!)? stats, int host_rows, int hot_block_size, int source_block_size, int resident_block_size, "
-            "int resident_null_block, int attention_block_stride, int union_rows, int attention_capacity=0) -> ()");
+            "int resident_null_block, int attention_block_stride, int union_rows, int attention_capacity=0, "
+            "Tensor(b!)? ages=None, int probation_age=4) -> ()");
     ops.impl("hisparse_resolve_residency", torch::kPrivateUse1, &vllm_ascend::hisparse::resolve_residency);
-    ops.def("hisparse_resolver_validate_scratch(int hot, int union_rows) -> ()",
-            [](int64_t hot, int64_t union_rows) {
-                vllm_ascend::hisparse::validate_resolver_scratch(hot, union_rows);
+    ops.def("hisparse_resolver_validate_scratch(int hot, int union_rows, bool with_age=False) -> ()",
+            [](int64_t hot, int64_t union_rows, bool with_age) {
+                vllm_ascend::hisparse::validate_resolver_scratch(hot, union_rows, with_age);
             });
     ops.def("get_npu_view_from_cpu_tensor(Tensor cpu_tensor) -> Tensor?");
     ops.impl("get_npu_view_from_cpu_tensor", c10::DispatchKey::CompositeExplicitAutograd,

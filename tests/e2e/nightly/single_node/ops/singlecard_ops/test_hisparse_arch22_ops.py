@@ -10,6 +10,7 @@ import pytest
 import torch
 import torch_npu  # noqa: F401
 
+from benchmarks.benchmark_hisparse_eviction import NativeResolver, Reference, make_trace
 from vllm_ascend.hisparse.cache_ops import HiSparseNPUOps, ResolverWorkspace
 from vllm_ascend.hisparse.host_pool import _ACL_HAC_AIV, allocate_mapped_host
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
@@ -1105,3 +1106,65 @@ def test_union_overflow_preserves_state(capture, compact):
         torch.npu.synchronize()
         if graph is not None:
             graph.reset()
+
+
+@pytest.mark.parametrize("probation", [None, 0, 4, 32767])
+def test_eviction_policy_mtp3_graph_replays(probation):
+    queries, topk, hot_size = 4, 2048, 10240
+    trace = list(make_trace("reuse-plus-scan", 8, queries, topk, hot_size))
+    resolver = NativeResolver(queries, topk, hot_size, max(map(max, trace)) + 1, probation)
+    inputs = [resolver.tensor(selection) for selection in trace]
+    resolver.verify(trace, inputs)
+
+    indices = inputs[0].clone()
+    reference = Reference(hot_size, probation)
+    with _invalidation_graph(lambda: resolver.resolve(indices)) as (graph, stream):
+        with torch.npu.stream(stream):
+            resolver.reset()
+        with torch.npu.graph(graph, stream=stream):
+            resolver.resolve(indices)
+        with torch.npu.stream(stream):
+            resolver.reset()
+            for selection, logical in zip(trace, inputs):
+                plan, _ = reference.resolve(selection)
+                indices.copy_(logical)
+                graph.replay()
+                assert not resolver.errors[:, 0].cpu().any()
+                assert resolver.counts.sum().item() == len(plan)
+                assert resolver.tags[0].tolist() == reference.tags
+                assert resolver.order[0].tolist() == reference.order
+                if resolver.ages is not None:
+                    assert resolver.ages[0].tolist() == reference.ages
+
+
+def test_eviction_policy_resident_hit_ages_once_and_ignores_padding():
+    queries, topk, hot_size = 4, 2048, 10240
+    resolver = NativeResolver(queries, topk, hot_size, 256, 4)
+    resolver.reset()
+    resolver.tags[0, :2] = torch.tensor([128, 129], dtype=torch.int32, device=resolver.device)
+    resolver.ages[0, :3] = torch.tensor([32767, 5, 27], dtype=torch.int16, device=resolver.device)
+    resolver.valid_rows.fill_(queries - 1)
+    indices = torch.zeros((queries, topk), dtype=torch.int32, device=resolver.device)
+    source = torch.tensor([[1]], dtype=torch.int32, device=resolver.device)
+    resident = torch.tensor([[2]], dtype=torch.int32, device=resolver.device)
+
+    resolver.resolve(indices, source, resident)
+    assert not resolver.errors[:, 0].cpu().any()
+    assert resolver.counts.tolist() == [0] * queries
+    assert resolver.ages[0, :3].tolist() == [32767, 6, 27]
+    assert resolver.out[:, 0].tolist() == [256, 256, 256, -1]
+    assert torch.equal(resolver.order[0], resolver.initial_order)
+
+
+def test_eviction_policy_prefers_invalidated_slot():
+    resolver = NativeResolver(1, 4, 128, 256, 4)
+    resolver.reset()
+    resolver.tags[0, :-1].copy_(torch.arange(127, dtype=torch.int32, device=resolver.device))
+    resolver.ages[0, 0] = 19
+    resolver.ages[0, -1] = 32767
+    resolver.resolve(resolver.tensor([1, 128, 129, 128]))
+
+    assert not resolver.errors[:, 0].cpu().any()
+    assert resolver.counts.tolist() == [2]
+    assert resolver.victims[0, :2].tolist() == [127, 0]
+    assert resolver.ages[0, [127, 0, 1, 2]].tolist() == [4, 4, 0, 1]

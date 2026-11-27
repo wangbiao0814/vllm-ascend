@@ -38,6 +38,7 @@ TILING_DATA_FIELD_DEF(uint64_t, hashSize);
 TILING_DATA_FIELD_DEF(uint64_t, attentionCapacity);
 TILING_DATA_FIELD_DEF(uint64_t, byteMissMask);
 TILING_DATA_FIELD_DEF(uint32_t, ubBytes);
+TILING_DATA_FIELD_DEF(uint32_t, probationAge);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(HisparseResolveResidency, HisparseResolveResidencyTilingData)

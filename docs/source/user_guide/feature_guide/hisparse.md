@@ -89,6 +89,25 @@ For a `MultiConnector` configuration, put `transfer_backend` in the
 `HiSparseConnector` child's extra configuration. This setting selects
 the private Host allocator. Omitting it uses native ACL Host-memory registration.
 
+### Hot KV eviction policy
+
+HiSparse defaults to `lru`. On A2/A3, enable experimental reuse-prioritized
+eviction in addition to the usual INT8 HiSparse options:
+
+```bash
+--additional-config '{"hisparse_eviction_config":{"policy":"reuse_prioritized_lru","probation_age":4}}'
+```
+
+Hot hits reset their age to zero. Each valid Decode resolver step increments
+the age of untouched Hot rows. A refill starts at `probation_age` (an integer
+from 0 to 32767, default 4). The policy fills empty slots first, then evicts the
+oldest unselected Hot rows by age. This can retain frequently selected rows
+while a request scans other parts of its context.
+
+The option uses extra device memory and on-core scratch. The resolver checks
+the combination of Hot buffer size, Top-K and speculative query length at
+startup.
+
 ### Combining HiSparse with AscendStore
 
 AscendStore saves and restores Host Source and NPU Indexer pages. HiSparse

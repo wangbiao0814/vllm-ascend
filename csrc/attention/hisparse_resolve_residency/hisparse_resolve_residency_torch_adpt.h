@@ -20,7 +20,7 @@ inline bool is_arch22_soc()
     return (socName == nullptr) || (std::string(socName).find("Ascend950") == std::string::npos);
 }
 
-inline void validate_resolver_scratch(int64_t hot, int64_t union_rows)
+inline void validate_resolver_scratch(int64_t hot, int64_t union_rows, bool with_age)
 {
     // Fail fast at workspace construction; the tiling stage enforces the same
     // platform-specific UB budget again at launch time. One body serves both
@@ -33,10 +33,11 @@ inline void validate_resolver_scratch(int64_t hot, int64_t union_rows)
     TORCH_CHECK(platform != nullptr, "HiSparse failed to query the target UB capacity");
     platform->GetCoreMemSize(platform_ascendc::CoreMemType::UB, platform_ub_bytes);
     const bool arch22 = is_arch22_soc();
+    TORCH_CHECK(!with_age || arch22, "HiSparse reuse-prioritized LRU requires A2/A3");
     const uint64_t budget = arch22 ? resolver_arch22_ub_budget(platform_ub_bytes)
                                    : resolver_simt_ub_budget(platform_ub_bytes);
     TORCH_CHECK(budget != 0, "HiSparse platform UB does not cover the resolver reserve.");
-    const uint64_t minimum_bytes = arch22 ? resolver_arch22_scratch_bytes(hot, union_rows + 1)
+    const uint64_t minimum_bytes = arch22 ? resolver_arch22_scratch_bytes(hot, union_rows + 1, with_age)
                                           : resolver_scratch_bytes(hot, union_rows + 1);
     TORCH_CHECK(minimum_bytes <= budget,
                 "HiSparse hot_size=", hot, ", max_union_rows=", union_rows,
@@ -66,9 +67,17 @@ inline void resolve_residency(
     const std::optional<at::Tensor> &miss_mask, const std::optional<at::Tensor> &stats,
     int64_t host_rows, int64_t hot_block_size, int64_t source_block_size,
     int64_t resident_block_size, int64_t resident_null_block,
-    int64_t attention_block_stride, int64_t union_rows, int64_t attention_capacity)
+    int64_t attention_block_stride, int64_t union_rows, int64_t attention_capacity,
+    const std::optional<at::Tensor> &ages, int64_t probation_age)
 {
     const int64_t topk = logical.size(1);
+    TORCH_CHECK(probation_age >= 0 && probation_age <= kMaxProbationAge, "invalid HiSparse probation age");
+    if (ages.has_value()) {
+        TORCH_CHECK(is_arch22_soc() && ages->device() == dgi.device() && ages->scalar_type() == at::kShort &&
+                    ages->is_contiguous() && ages->sizes() == dgi.sizes(),
+                    "HiSparse ages require A2/A3 and an int16 tensor matching hot tags");
+    }
+    const at::Tensor ages_t = ages.value_or(at::Tensor());
     // EXEC_NPU_CMD binds arguments to non-const lvalue references, so every
     // argument must be a named local instead of a temporary.
     const at::Tensor requests_t = requests.value_or(at::Tensor());
@@ -101,12 +110,12 @@ inline void resolve_residency(
         logical_stride, source_stride,
         resident_stride, hot_table_stride,
         attention_stride, counts_stride,
-        miss_mask_bytes,
+        miss_mask_bytes, probation_age,
         dgi, lru, output, resolved, errors,
         attention_t, counts_t,
         swap_host_t, swap_device_t,
         swap_counts_t, miss_mask_t,
-        stats_t);
+        stats_t, ages_t);
     if (stats_t.defined() && is_arch22_soc()) {
         // Submit queued side-stream waits before allocating graph temporaries.
         c10_npu::getCurrentNPUStream().stream();

@@ -46,7 +46,15 @@ class ResolverWorkspace:
     """Fixed scratch shared by one index group on its ordered copy stream."""
 
     def __init__(
-        self, max_rows: int, hot_size: int, max_union_rows: int, device: torch.device, *, max_topk: int | None = None
+        self,
+        max_rows: int,
+        hot_size: int,
+        max_union_rows: int,
+        device: torch.device,
+        *,
+        max_topk: int | None = None,
+        age_state_rows: int = 0,
+        probation_age: int = 4,
     ) -> None:
         if not 0 < max_union_rows <= hot_size <= 32768 or max_rows <= 0:
             raise ValueError("HiSparse requires 0 < union <= hot_size <= 32768 and positive max_rows")
@@ -57,7 +65,15 @@ class ResolverWorkspace:
         if not 0 < self.max_topk <= hot_size:
             raise ValueError("HiSparse resolver TopK capacity must be positive and fit the Hot cache")
         self.native = _load_resolver()
-        self.native.hisparse_resolver_validate_scratch(hot_size, max_union_rows)
+        self.ages = None
+        self.probation_age = probation_age
+        if age_state_rows:
+            self.native.hisparse_resolver_validate_scratch(hot_size, max_union_rows, True)
+            # Slots with invalid tags never consume stale ages. Refills always
+            # replace the age, including after a recycled state row or reset.
+            self.ages = torch.zeros((age_state_rows, hot_size), dtype=torch.int16, device=device)
+        else:
+            self.native.hisparse_resolver_validate_scratch(hot_size, max_union_rows)
         # One resolved Host row per selected token, not per Hot-cache slot.
         self.first_refs = torch.empty(max_rows * self.max_topk, dtype=torch.int32, device=device)
         self.errors = torch.zeros((max_rows, 8), dtype=torch.int32, device=device)
@@ -259,6 +275,7 @@ class HiSparseNPUOps:
         """
         rows, topk = arguments["global_indices"].shape
         resolved = workspace.first_refs[: rows * topk].view(rows, topk)
+        policy_args = () if workspace.ages is None else (workspace.ages, workspace.probation_age)
         workspace.native.hisparse_resolve_residency(
             arguments["global_indices"],
             arguments["hot_block_table"],
@@ -287,6 +304,7 @@ class HiSparseNPUOps:
             arguments["attention_block_stride"] if self.attention_block_stride is None else self.attention_block_stride,
             arguments["max_union_rows"],
             self.attention_capacity,
+            *policy_args,
         )
 
     def hisparse_gather_compact(

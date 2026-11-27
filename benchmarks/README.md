@@ -250,3 +250,29 @@ hashes, loaded module paths, and Git revisions when available. Use these fields
 to verify which implementations were compared. Compare results within the same
 environment and workload, including sparse cases that may have constant-factor
 tradeoffs; local metadata speedups do not establish end-to-end serving gains.
+
+### HiSparse Hot KV eviction
+
+Run the same synthetic Decode traces against LRU and reuse-prioritized LRU.
+The CPU run reports the distinct Host lookup hit rate and miss count:
+
+```bash
+python benchmarks/benchmark_hisparse_eviction.py
+```
+
+With an A2/A3 build that includes the updated resolver, select `--device npu`.
+The harness verifies the native swap plans and cache state step by step against
+the CPU reference. It then times the resolver alone with NPU events, excluding
+Host KV payload copies. Run both graph replay and eager dispatch:
+
+```bash
+python benchmarks/benchmark_hisparse_eviction.py --device npu --execution graph --mtp 3
+python benchmarks/benchmark_hisparse_eviction.py --device npu --execution eager --mtp 3
+```
+
+The reported latency is the median across replayed traces divided by the
+number of resolver calls per trace. The traces measure sliding-window reuse,
+a repeatedly accessed working set mixed with scans, cyclic overflow, and
+fully disjoint selections. A Resident-only case measures the fast path with
+zero Host lookups. Duplicate query selections count once per round
+in the hit-rate denominator.

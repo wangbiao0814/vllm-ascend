@@ -11,11 +11,12 @@
 #pragma once
 
 #include "kernel_operator.h"
+#include "../resolver_scratch.h"
 #include <cstdint>
 
 struct HiSparseArch22Descriptor {
-    uint64_t pointers[19];
-    uint64_t geometry[25];
+    uint64_t pointers[20];
+    uint64_t geometry[26];
 };
 
 namespace {
@@ -23,6 +24,9 @@ using namespace AscendC;
 constexpr int32_t kHit = int32_t(0x80000000U);
 constexpr int32_t kMiss = 0x40000000;
 constexpr int32_t kSlotMask = 0xFFFF;
+// These flags live only in order, independently of the union hash values.
+constexpr int32_t kEmptySlot = 1 << 16;
+constexpr int32_t kRefilledSlot = 1 << 17;
 constexpr int32_t kTile = 256;
 constexpr int32_t kMaxResidentColumns = 1024;
 
@@ -73,6 +77,11 @@ public:
         tags = tagsBuffer.Get<int32_t>();
         order = orderBuffer.Get<int32_t>();
         io = ioBuffer.Get<int32_t>();
+        if (d.pointers[19]) {
+            const auto bytes = vllm_ascend::hisparse::resolver_arch22_age_bytes(hot, true);
+            pipe.InitBuffer(agesBuffer, static_cast<uint32_t>(bytes));
+            ages = agesBuffer.Get<int16_t>();
+        }
     }
 
     __aicore__ inline int32_t Request(int32_t row) const
@@ -387,6 +396,94 @@ public:
         return true;
     }
 
+    __aicore__ inline bool IsFollower(int32_t validRows) const
+    {
+        return first < validRows && first && d.pointers[1] && Request(first - 1) == request;
+    }
+
+    __aicore__ inline void LoadTags()
+    {
+        GlobalTensor<int32_t> globalTags;
+        globalTags.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(d.pointers[6]));
+        DataCopyPad(tags, globalTags[int64_t(state) * hot],
+                    DataCopyExtParams{1, uint32_t(hot * sizeof(int32_t)), 0, 0, 0},
+                    DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
+        Sync<HardEvent::MTE2_S>();
+    }
+
+    __aicore__ inline void LoadAges()
+    {
+        GlobalTensor<int16_t> globalAges;
+        globalAges.SetGlobalBuffer(reinterpret_cast<__gm__ int16_t *>(d.pointers[19]));
+        DataCopyPad(ages, globalAges[int64_t(state) * hot],
+                    DataCopyExtParams{1, uint32_t(hot * sizeof(int16_t)), 0, 0, 0},
+                    DataCopyPadExtParams<int16_t>{false, 0, 0, 0});
+        Sync<HardEvent::MTE2_S>();
+    }
+
+    __aicore__ inline void AdvanceAge(int32_t slot)
+    {
+        int16_t age = ages.GetValue(slot);
+        if (age < vllm_ascend::hisparse::kMaxProbationAge) {
+            ages.SetValue(slot, int16_t(age + 1));
+        }
+    }
+
+    __aicore__ inline void AgeResidentRequest()
+    {
+        LoadTags();
+        LoadAges();
+        for (int32_t slot = 0; slot < hot; ++slot) {
+            if (tags.GetValue(slot) >= 0) AdvanceAge(slot);
+        }
+        Store(d.pointers[19], int64_t(state) * hot, ages, hot);
+    }
+
+    __aicore__ inline void AppendSlot(int32_t slot, int32_t &out)
+    {
+        auto lruOut = io.ReinterpretCast<int16_t>();
+        lruOut.SetValue(out % kTile, int16_t(slot));
+        ++out;
+        if (out % kTile == 0 || out == hot) {
+            int32_t count = out % kTile == 0 ? kTile : out % kTile;
+            Store(d.pointers[7], int64_t(state) * hot + out - count, lruOut, count);
+        }
+    }
+
+    __aicore__ inline void WriteAgeOrder(int32_t hits, int32_t evictable)
+    {
+        // order stores candidates in reverse queue order. Visit each class
+        // oldest first, matching allocation order for the two refill classes.
+        int32_t out = 0;
+        int32_t probation = d.geometry[25];
+        for (int32_t p = 0; p < evictable; ++p) {
+            int32_t entry = order.GetValue(hot - 1 - p);
+            if ((entry & (kEmptySlot | kRefilledSlot)) == kEmptySlot) AppendSlot(entry & kSlotMask, out);
+        }
+        int32_t split = 0;
+        for (; split < evictable; ++split) {
+            int32_t entry = order.GetValue(hot - 1 - split);
+            if (entry & (kEmptySlot | kRefilledSlot)) continue;
+            if (ages.GetValue(entry) < probation) break;
+            AppendSlot(entry, out);
+        }
+        for (int32_t p = 0; p < evictable; ++p) {
+            int32_t entry = order.GetValue(hot - 1 - p);
+            if ((entry & (kEmptySlot | kRefilledSlot)) == (kEmptySlot | kRefilledSlot)) {
+                AppendSlot(entry & kSlotMask, out);
+            }
+        }
+        for (int32_t p = 0; p < evictable; ++p) {
+            int32_t entry = order.GetValue(hot - 1 - p);
+            if ((entry & (kEmptySlot | kRefilledSlot)) == kRefilledSlot) AppendSlot(entry & kSlotMask, out);
+        }
+        for (int32_t p = split; p < evictable; ++p) {
+            int32_t entry = order.GetValue(hot - 1 - p);
+            if (!(entry & (kEmptySlot | kRefilledSlot))) AppendSlot(entry, out);
+        }
+        for (int32_t p = 0; p < hits; ++p) AppendSlot(order.GetValue(p), out);
+    }
+
     __aicore__ inline void Process()
     {
         first = GetBlockIdx();
@@ -402,17 +499,23 @@ public:
             state = request >= 0 && request < d.geometry[5] ? Read<int32_t>(d.pointers[2], request) : -1;
         }
         bool valid = state >= 0 && state < d.geometry[6] && first < validRows;
-        // Every row uses the same immutable request-table proof. A successful
-        // proof only publishes this row and never mutates Hot/LRU state.
-        if (valid && PublishResident()) return;
-        // Mixed requests retain a single writer for their union and all rows.
-        if (first < validRows && first && d.pointers[1] && Request(first - 1) == request) return;
+        const bool withAge = d.pointers[19] != 0;
+        // Every row can publish its own proven Resident indices. Only the
+        // request leader ever mutates Hot state, including on a Resident hit.
+        if (valid && PublishResident()) {
+            if (withAge && !IsFollower(validRows)) AgeResidentRequest();
+            return;
+        }
+        if (IsFollower(validRows)) return;
         while (d.pointers[1] && end < validRows && Request(end) == request) ++end;
         if (!valid) {
             Publish(false);
             return;
         }
-        if (PublishResident(true)) return;
+        if (PublishResident(true)) {
+            if (withAge) AgeResidentRequest();
+            return;
+        }
         for (int32_t h = 0; h < hashSize; ++h) keys.SetValue(h, -1);
         // Construct the entire cold union before inspecting or evicting Hot.
         // Descriptor fields are hoisted into locals: the compiler cannot
@@ -433,21 +536,17 @@ public:
             }
         }
         if (!references || error) {
+            if (withAge && !error) AgeResidentRequest();
             Publish(true);
             return;
         }
-        GlobalTensor<int32_t> globalTags;
-        globalTags.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(d.pointers[6]));
-        DataCopyPad(tags, globalTags[int64_t(state) * hot],
-                    DataCopyExtParams{1, uint32_t(hot * sizeof(int32_t)), 0, 0, 0},
-                    DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
-        Sync<HardEvent::MTE2_S>();
+        LoadTags();
         // LRU is oldest-first and always a permutation of the hot slots (the
         // resolver itself rebuilds it every launch, and Core keeps the same
         // invariant). One pass over the LRU list therefore both marks the
         // smallest hit slot per union entry and builds the reversed
         // evictable/hit partition, halving the hash probes per slot.
-        int32_t hits = 0, evictable = 0;
+        int32_t hits = 0, evictable = 0, empty = 0;
         const uint64_t lruBase = d.pointers[7];
         for (int32_t p = 0; p < hot; ++p) {
             int32_t slot = Read<int16_t>(lruBase, int64_t(state) * hot + p);
@@ -462,6 +561,10 @@ public:
                     if (values.GetValue(h) > value) values.SetValue(h, value);
                 }
             }
+            if (withAge && host < 0) {
+                ++empty;
+                slot |= kEmptySlot;
+            }
             order.SetValue(hit ? hits++ : hot - 1 - evictable++, slot);
         }
         for (int32_t h = 0; h < hashSize; ++h) {
@@ -470,6 +573,8 @@ public:
         if (hits + misses > d.geometry[21] || hits + misses > hot) error = hits + misses;
         if (error) { Publish(true); return; }
 
+        if (withAge) LoadAges();
+        int32_t emptyCursor = 0, occupiedCursor = 0;
         int32_t rank = 0, buffered = 0;
         const int64_t swapBase = int64_t(first) * topk;
         position = 0;
@@ -479,7 +584,19 @@ public:
                 Translate(Read<int32_t>(logicalBase, int64_t(row) * logicalStride + col), host, device);
                 int32_t h = device < 0 && host >= 0 ? Lookup(host) : -1;
                 if (h >= 0 && values.GetValue(h) == position) {
-                    int32_t slot = order.GetValue(hot - 1 - rank);
+                    int32_t orderPosition = hot - 1 - rank;
+                    if (withAge) {
+                        const bool useEmpty = rank < empty;
+                        int32_t &cursor = useEmpty ? emptyCursor : occupiedCursor;
+                        while (bool(order.GetValue(hot - 1 - cursor) & kEmptySlot) != useEmpty) ++cursor;
+                        orderPosition = hot - 1 - cursor++;
+                    }
+                    int32_t entry = order.GetValue(orderPosition);
+                    int32_t slot = entry & kSlotMask;
+                    if (withAge) {
+                        order.SetValue(orderPosition, entry | kRefilledSlot);
+                        ages.SetValue(slot, int16_t(d.geometry[25]));
+                    }
                     values.SetValue(h, kMiss | slot);
                     tags.SetValue(slot, host);
                     io.SetValue(buffered, host);
@@ -495,6 +612,17 @@ public:
             }
         }
         Store(d.pointers[6], int64_t(state) * hot, tags, hot);
+        if (withAge) {
+            for (int32_t p = 0; p < evictable; ++p) {
+                int32_t entry = order.GetValue(hot - 1 - p);
+                if (!(entry & (kEmptySlot | kRefilledSlot))) AdvanceAge(entry);
+            }
+            for (int32_t p = 0; p < hits; ++p) ages.SetValue(order.GetValue(p), int16_t(0));
+            Store(d.pointers[19], int64_t(state) * hot, ages, hot);
+            WriteAgeOrder(hits, evictable);
+            Publish(true);
+            return;
+        }
         int32_t remaining = hot - hits - misses;
         auto lruOut = io.ReinterpretCast<int16_t>();
         for (int32_t base = 0; base < hot; base += kTile) {
@@ -620,7 +748,9 @@ private:
     // Last valid page/block-table entries cached by Translate/Physical.
     int32_t reqCol = -1, reqPage = 0, stCol = -1, stPage = 0, blkCol = -1, blkPage = 0;
     TBuf<TPosition::VECCALC> keysBuffer, valuesBuffer, tagsBuffer, orderBuffer, ioBuffer;
+    TBuf<TPosition::VECCALC> agesBuffer;
     LocalTensor<int32_t> keys, values, tags, order, io;
+    LocalTensor<int16_t> ages;
 };
 
 }  // namespace

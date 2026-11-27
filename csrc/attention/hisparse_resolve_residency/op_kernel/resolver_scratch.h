@@ -47,20 +47,26 @@ inline constexpr uint64_t resolver_arch22_ub_budget(uint64_t platform_ub_bytes) 
         platform_ub_bytes - kResolverArch22ReserveBytes : 0;
 }
 
-constexpr uint64_t resolver_arch22_scratch_words(uint64_t hot, uint64_t hash_size) {
-    return 2 * hash_size + 2 * hot + 512;
+constexpr uint64_t resolver_arch22_pair_bytes(uint64_t entries) {
+    // TPipe rounds each of the two int32 buffers to a 32-byte boundary.
+    return (entries + 7) / 8 * 64;
 }
 
-constexpr uint64_t resolver_arch22_scratch_bytes(uint64_t hot, uint64_t hash_size) {
-    return (resolver_arch22_scratch_words(hot, hash_size) + 15) / 16 * 64 + kResolverDescriptorBytes;
+constexpr int64_t kMaxProbationAge = 32767;
+constexpr uint64_t resolver_arch22_age_bytes(uint64_t hot, bool with_age) {
+    return with_age ? (hot * sizeof(int16_t) + 63) / 64 * 64 : 0;
 }
 
-constexpr uint64_t resolver_arch22_hash_capacity(uint64_t hot, uint64_t union_rows, uint64_t ub_budget) {
+constexpr uint64_t resolver_arch22_scratch_bytes(uint64_t hot, uint64_t hash_size, bool with_age = false) {
+    return resolver_arch22_pair_bytes(hot) + resolver_arch22_pair_bytes(hash_size) + 2 * 1024 +
+           kResolverDescriptorBytes + resolver_arch22_age_bytes(hot, with_age);
+}
+
+constexpr uint64_t resolver_arch22_hash_capacity(uint64_t hot, uint64_t union_rows, uint64_t ub_budget, bool with_age) {
     uint64_t hash_size = 1;
     while (hash_size <= union_rows) hash_size <<= 1;
-    const uint64_t available_words = (ub_budget - kResolverDescriptorBytes) / 64 * 16;
-    const uint64_t fixed_words = 2 * hot + 512;
-    const uint64_t max_hash_size = (available_words - fixed_words) / 2;
+    const uint64_t fixed_bytes = resolver_arch22_scratch_bytes(hot, 0, with_age);
+    const uint64_t max_hash_size = ub_budget > fixed_bytes ? (ub_budget - fixed_bytes) / 64 * 8 : 0;
     return hash_size < max_hash_size ? hash_size : max_hash_size;
 }
 }  // namespace vllm_ascend::hisparse

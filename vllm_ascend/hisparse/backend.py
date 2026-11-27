@@ -13,6 +13,8 @@ import torch
 from vllm.logger import logger
 from vllm.v1.hisparse.backend import HiSparseBackend
 
+from vllm_ascend.ascend_config import get_ascend_config
+
 if TYPE_CHECKING:
     from vllm.v1.hisparse.runtime import HiSparseRuntime
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -36,12 +38,20 @@ def initialize_worker_dma(worker) -> None:
 def _allocate_resolver_workspace(runtime: HiSparseRuntime):
     from vllm_ascend.hisparse.cache_ops import ResolverWorkspace
 
+    try:
+        eviction = get_ascend_config().hisparse_eviction_config
+    except RuntimeError:
+        # Standalone callers can bind the resolver without a configured engine.
+        eviction = None
+    with_age = eviction is not None and eviction.policy == "reuse_prioritized_lru"
     return ResolverWorkspace(
         max_rows=runtime.max_swap_rows,
         hot_size=runtime.region_stride,
         max_union_rows=runtime.max_union_rows,
         device=runtime.device,
         max_topk=runtime.index_group.shared_topk.device_topk_rows.shape[1],
+        age_state_rows=runtime.index_group.device_global_indices.size(0) if with_age else 0,
+        probation_age=eviction.probation_age if with_age else 4,
     )
 
 

@@ -40,6 +40,7 @@ public:
         Attr("attentionStride").AttrType(REQUIRED).Int();
         Attr("countsStride").AttrType(REQUIRED).Int();
         Attr("byteMissMask").AttrType(REQUIRED).Int();
+        Attr("probationAge").AttrType(REQUIRED).Int();
         Output("tags").ParamType(OPTIONAL)
             .DataType({ge::DT_INT32, ge::DT_INT32, ge::DT_INT32}).Format(formats).UnknownShapeFormat(formats);
         Output("lru").ParamType(OPTIONAL)
@@ -64,6 +65,8 @@ public:
             .DataType({ge::DT_INT32, ge::DT_UINT8, ge::DT_BOOL}).Format(formats).UnknownShapeFormat(formats);
         Output("stats").ParamType(OPTIONAL)
             .DataType({ge::DT_INT64, ge::DT_INT64, ge::DT_INT64}).Format(formats).UnknownShapeFormat(formats);
+        Output("ages").ParamType(OPTIONAL)
+            .DataType({ge::DT_INT16, ge::DT_INT16, ge::DT_INT16}).Format(formats).UnknownShapeFormat(formats);
         OpAICoreConfig config;
         config.DynamicCompileStaticFlag(true)
             .DynamicShapeSupportFlag(true)
