@@ -13,7 +13,7 @@ import torch_npu  # noqa: F401
 from benchmarks.benchmark_hisparse_eviction import NativeResolver, Reference, make_trace
 from vllm_ascend.hisparse.cache_ops import HiSparseNPUOps, ResolverWorkspace
 from vllm_ascend.hisparse.host_pool import _ACL_HAC_AIV, allocate_mapped_host
-from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+from vllm_ascend.utils import AscendDeviceType, bootstrap_custom_op_env, get_ascend_device_type
 
 _ACL_ERROR_RT_FEATURE_NOT_SUPPORT = 207000
 
@@ -24,6 +24,7 @@ def _require_arch22():
         pytest.skip("requires an Ascend NPU")
     if get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3):
         pytest.skip("requires the arch22 kernel")
+    bootstrap_custom_op_env()
     if not hasattr(torch.ops._C_ascend, "hisparse_resolve_residency"):
         import vllm_ascend.vllm_ascend_C  # type: ignore[import-not-found, import-untyped]  # noqa: F401
     assert hasattr(torch.ops._C_ascend, "hisparse_resolve_residency"), "rebuild the arch22 extension"

@@ -94,6 +94,10 @@ class NativeResolver:
         import torch
         import torch_npu  # noqa: F401
 
+        from vllm_ascend.utils import bootstrap_custom_op_env
+
+        # The extension reads and caches custom OPP paths when it is loaded.
+        bootstrap_custom_op_env()
         if not hasattr(torch.ops._C_ascend, "hisparse_resolve_residency"):
             import vllm_ascend.vllm_ascend_C  # noqa: F401
 
