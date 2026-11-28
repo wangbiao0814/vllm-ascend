@@ -9,6 +9,7 @@
 #include <tiling/platform/platform_ascendc.h>
 
 #include "op_kernel/resolver_scratch.h"
+#include "op_kernel/age_options.h"
 
 namespace vllm_ascend::hisparse {
 
@@ -20,7 +21,7 @@ inline bool is_arch22_soc()
     return (socName == nullptr) || (std::string(socName).find("Ascend950") == std::string::npos);
 }
 
-inline void validate_resolver_scratch(int64_t hot, int64_t union_rows, bool with_age)
+inline int64_t validate_resolver_scratch(int64_t hot, int64_t union_rows, bool with_age, bool reuse_age_ub)
 {
     // Fail fast at workspace construction; the tiling stage enforces the same
     // platform-specific UB budget again at launch time. One body serves both
@@ -37,13 +38,16 @@ inline void validate_resolver_scratch(int64_t hot, int64_t union_rows, bool with
     const uint64_t budget = arch22 ? resolver_arch22_ub_budget(platform_ub_bytes)
                                    : resolver_simt_ub_budget(platform_ub_bytes);
     TORCH_CHECK(budget != 0, "HiSparse platform UB does not cover the resolver reserve.");
-    const uint64_t minimum_bytes = arch22 ? resolver_arch22_scratch_bytes(hot, union_rows + 1, with_age)
+    const bool separate_age_ub = with_age && !reuse_age_ub;
+    const uint64_t minimum_bytes = arch22 ? resolver_arch22_scratch_bytes(hot, union_rows + 1, separate_age_ub)
                                           : resolver_scratch_bytes(hot, union_rows + 1);
     TORCH_CHECK(minimum_bytes <= budget,
                 "HiSparse hot_size=", hot, ", max_union_rows=", union_rows,
                 " needs at least ", minimum_bytes,
                 " UB bytes; the target allows ", budget,
                 ". Lower device_buffer_size or speculative tokens.");
+    return arch22 ? resolver_arch22_hash_capacity(hot, union_rows, budget, separate_age_ub)
+                  : resolver_hash_capacity(hot, union_rows, budget);
 }
 
 /**
@@ -68,7 +72,8 @@ inline void resolve_residency(
     int64_t host_rows, int64_t hot_block_size, int64_t source_block_size,
     int64_t resident_block_size, int64_t resident_null_block,
     int64_t attention_block_stride, int64_t union_rows, int64_t attention_capacity,
-    const std::optional<at::Tensor> &ages, int64_t probation_age)
+    const std::optional<at::Tensor> &ages, int64_t probation_age,
+    const std::optional<at::Tensor> &pending_age, int64_t age_options, int64_t hash_limit)
 {
     const int64_t topk = logical.size(1);
     TORCH_CHECK(probation_age >= 0 && probation_age <= kMaxProbationAge, "invalid HiSparse probation age");
@@ -77,7 +82,14 @@ inline void resolve_residency(
                     ages->is_contiguous() && ages->sizes() == dgi.sizes(),
                     "HiSparse ages require A2/A3 and an int16 tensor matching hot tags");
     }
+    if (pending_age.has_value()) {
+        TORCH_CHECK(ages.has_value() && pending_age->device() == dgi.device() &&
+                    pending_age->scalar_type() == at::kInt && pending_age->is_contiguous() &&
+                    pending_age->dim() == 2 && pending_age->size(0) == dgi.size(0) &&
+                    pending_age->size(1) == kPendingAgeStride, "invalid HiSparse pending-age state");
+    }
     const at::Tensor ages_t = ages.value_or(at::Tensor());
+    const at::Tensor pending_t = pending_age.value_or(at::Tensor());
     // EXEC_NPU_CMD binds arguments to non-const lvalue references, so every
     // argument must be a named local instead of a temporary.
     const at::Tensor requests_t = requests.value_or(at::Tensor());
@@ -110,12 +122,12 @@ inline void resolve_residency(
         logical_stride, source_stride,
         resident_stride, hot_table_stride,
         attention_stride, counts_stride,
-        miss_mask_bytes, probation_age,
+        miss_mask_bytes, probation_age, age_options, hash_limit,
         dgi, lru, output, resolved, errors,
         attention_t, counts_t,
         swap_host_t, swap_device_t,
         swap_counts_t, miss_mask_t,
-        stats_t, ages_t);
+        stats_t, ages_t, pending_t);
     if (stats_t.defined() && is_arch22_soc()) {
         // Submit queued side-stream waits before allocating graph temporaries.
         c10_npu::getCurrentNPUStream().stream();

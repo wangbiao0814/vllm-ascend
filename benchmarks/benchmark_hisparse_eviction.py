@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Compare arch22 HiSparse eviction on deterministic Decode traces."""
 
+from __future__ import annotations
+
 import argparse
+from collections.abc import Callable
 from statistics import median
 
 SCENARIOS = ("sliding-window", "reuse-plus-scan", "cyclic-overflow", "disjoint")
@@ -37,6 +40,12 @@ class Reference:
 
     def resolve(self, indices):
         wanted = dict.fromkeys(token for token in indices if token >= 0)
+        if not wanted:
+            if self.probation_age is not None:
+                for slot, tag in enumerate(self.tags):
+                    if tag >= 0:
+                        self.ages[slot] = min(32767, self.ages[slot] + 1)
+            return [], [-1] * len(indices)
         hits, available = [], []
         hot = {}
         for slot in self.order:
@@ -90,10 +99,13 @@ class Reference:
 class NativeResolver:
     """Call only the native resolver. Host payload copies are outside the timed region."""
 
-    def __init__(self, queries, topk, hot_size, host_size, probation_age):
+    def __init__(
+        self, queries, topk, hot_size, host_size, probation_age, *, lazy_age=False, age_options=0, hash_limit=0
+    ):
         import torch
         import torch_npu  # noqa: F401
 
+        from vllm_ascend.hisparse.cache_ops import AGE_REUSE_TAG_SCRATCH, PENDING_AGE_ROW_WIDTH
         from vllm_ascend.utils import bootstrap_custom_op_env
 
         # The extension reads and caches custom OPP paths when it is loaded.
@@ -109,7 +121,16 @@ class NativeResolver:
         self.block = 128
         self.hot_size = hot_size
         self.probation_age = probation_age
-        torch.ops._C_ascend.hisparse_resolver_validate_scratch(hot_size, queries * topk, probation_age is not None)
+        self.age_options = age_options
+        self.hash_limit = hash_limit
+        self.hash_capacity = torch.ops._C_ascend.hisparse_resolver_validate_scratch(
+            hot_size, queries * topk, probation_age is not None, bool(age_options & AGE_REUSE_TAG_SCRATCH)
+        )
+        if hash_limit:
+            self.hash_capacity = min(self.hash_capacity, hash_limit)
+        self.pending_age = (
+            torch.zeros((1, PENDING_AGE_ROW_WIDTH), dtype=torch.int32, device=self.device) if lazy_age else None
+        )
         self.requests = torch.zeros(queries, dtype=torch.int32, device=self.device)
         self.valid_rows = torch.tensor([queries], dtype=torch.int32, device=self.device)
         self.table = torch.arange(hot_size // self.block, dtype=torch.int32, device=self.device)[None]
@@ -128,6 +149,8 @@ class NativeResolver:
         self.order.copy_(self.initial_order[None])
         if self.ages is not None:
             self.ages.zero_()
+        if self.pending_age is not None:
+            self.pending_age.zero_()
 
     def tensor(self, values):
         return self.torch.tensor(values, dtype=self.torch.int32).view(self.shape).to(self.device)
@@ -163,6 +186,9 @@ class NativeResolver:
             0,
             self.ages,
             4 if self.probation_age is None else self.probation_age,
+            self.pending_age,
+            self.age_options,
+            self.hash_limit,
         )
 
     def verify(self, trace, inputs):
@@ -181,10 +207,18 @@ class NativeResolver:
             assert self.tags[0].tolist() == ref.tags, step
             assert self.order[0].tolist() == ref.order, step
             if self.ages is not None:
-                assert self.ages[0].tolist() == ref.ages, step
+                actual = self.ages[0].tolist()
+                assert all(actual[i] == ref.ages[i] for i, tag in enumerate(ref.tags) if tag >= 0), step
         return ref
 
-    def time_trace(self, inputs, repeats, graph_mode, *, source=None, resident=None):
+    def time_trace(
+        self, inputs, repeats, graph_mode, *, source=None, resident=None, gather: Callable[[], None] | None = None
+    ):
+        def step(indices):
+            self.resolve(indices, source, resident)
+            if gather is not None:
+                gather()
+
         torch = self.torch
         stream = torch.npu.Stream()
         stream.wait_stream(torch.npu.current_stream())
@@ -195,13 +229,13 @@ class NativeResolver:
                 for _ in range(2):
                     self.reset()
                     for indices in inputs:
-                        self.resolve(indices, source, resident)
+                        step(indices)
                 if graph_mode == "graph":
                     self.reset()
                     graph = torch.npu.NPUGraph()
                     with torch.npu.graph(graph, stream=stream):
                         for indices in inputs:
-                            self.resolve(indices, source, resident)
+                            step(indices)
                 start = torch.npu.Event(enable_timing=True)
                 end = torch.npu.Event(enable_timing=True)
                 for _ in range(repeats):
@@ -209,7 +243,7 @@ class NativeResolver:
                     start.record()
                     if graph is None:
                         for indices in inputs:
-                            self.resolve(indices, source, resident)
+                            step(indices)
                     else:
                         graph.replay()
                     end.record()

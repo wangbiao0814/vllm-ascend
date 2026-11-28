@@ -11,7 +11,14 @@ import torch
 import torch_npu  # noqa: F401
 
 from benchmarks.benchmark_hisparse_eviction import NativeResolver, Reference, make_trace
-from vllm_ascend.hisparse.cache_ops import HiSparseNPUOps, ResolverWorkspace
+from vllm_ascend.hisparse.cache_ops import (
+    AGE_GROUP_CANDIDATES,
+    AGE_REUSE_TAG_SCRATCH,
+    AGE_VECTOR_GROUPING,
+    AGE_VECTOR_INCREMENT,
+    HiSparseNPUOps,
+    ResolverWorkspace,
+)
 from vllm_ascend.hisparse.host_pool import _ACL_HAC_AIV, allocate_mapped_host
 from vllm_ascend.utils import AscendDeviceType, bootstrap_custom_op_env, get_ascend_device_type
 
@@ -1169,3 +1176,67 @@ def test_eviction_policy_prefers_invalidated_slot():
     assert resolver.counts.tolist() == [2]
     assert resolver.victims[0, :2].tolist() == [127, 0]
     assert resolver.ages[0, [127, 0, 1, 2]].tolist() == [4, 4, 0, 1]
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        0,
+        AGE_GROUP_CANDIDATES,
+        AGE_GROUP_CANDIDATES | AGE_REUSE_TAG_SCRATCH,
+        AGE_GROUP_CANDIDATES | AGE_REUSE_TAG_SCRATCH | AGE_VECTOR_INCREMENT,
+        AGE_GROUP_CANDIDATES | AGE_REUSE_TAG_SCRATCH | AGE_VECTOR_GROUPING,
+        AGE_GROUP_CANDIDATES | AGE_REUSE_TAG_SCRATCH | AGE_VECTOR_INCREMENT | AGE_VECTOR_GROUPING,
+    ],
+)
+def test_eviction_ablation_matches_reference(options):
+    queries, topk, hot_size = 4, 2048, 10240
+    trace = list(make_trace("reuse-plus-scan", 8, queries, topk, hot_size))
+    resolver = NativeResolver(
+        queries,
+        topk,
+        hot_size,
+        max(map(max, trace)) + 1,
+        4,
+        lazy_age=True,
+        age_options=options,
+    )
+    resolver.verify(trace, [resolver.tensor(rows) for rows in trace])
+
+
+def test_eviction_lazy_ages_after_resident_graph_replay():
+    queries, topk, hot_size = 4, 2048, 10240
+    resolver = NativeResolver(
+        queries,
+        topk,
+        hot_size,
+        256,
+        4,
+        lazy_age=True,
+        age_options=AGE_GROUP_CANDIDATES | AGE_REUSE_TAG_SCRATCH,
+    )
+    resolver.reset()
+    resolver.tags[0, :3] = torch.tensor([128, 129, 130], dtype=torch.int32, device=resolver.device)
+    resolver.ages[0, :3] = torch.tensor([32766, 0, 0], dtype=torch.int16, device=resolver.device)
+    source = torch.tensor([[1]], dtype=torch.int32, device=resolver.device)
+    resident = torch.tensor([[2]], dtype=torch.int32, device=resolver.device)
+    resident_queries = torch.zeros((queries, topk), dtype=torch.int32, device=resolver.device)
+    hot_queries = resident_queries.clone().fill_(129)
+
+    def forward():
+        resolver.resolve(resident_queries, source, resident)
+
+    with _invalidation_graph(forward) as (graph, stream):
+        with torch.npu.graph(graph, stream=stream):
+            forward()
+        with torch.npu.stream(stream):
+            resolver.pending_age.zero_()
+            resolver.valid_rows.fill_(queries - 1)
+            for _ in range(3):
+                graph.replay()
+            assert resolver.pending_age[0, 0].item() == 3
+            assert resolver.ages[0, :3].tolist() == [32766, 0, 0]
+            resolver.resolve(hot_queries)
+            assert not resolver.errors[:, 0].cpu().any()
+            assert resolver.pending_age[0, 0].item() == 0
+            assert resolver.ages[0, :3].tolist() == [32767, 0, 4]

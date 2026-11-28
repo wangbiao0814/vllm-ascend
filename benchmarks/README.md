@@ -276,3 +276,43 @@ a repeatedly accessed working set mixed with scans, cyclic overflow, and
 fully disjoint selections. A Resident-only case measures the fast path with
 zero Host lookups. Duplicate query selections count once per round
 in the hit-rate denominator.
+
+#### Eviction ablations
+
+Rebuild the Python extension and the custom OPP from the same checkout.
+The ablation runner verifies each native swap plan, queue, and valid age
+against the CPU reference before timing. It reports actual hash capacity,
+median microseconds per resolver call, and distinct-lookup hit rates.
+
+```bash
+python -m benchmarks.benchmark_hisparse_eviction_ablation --execution graph --output graph.json
+python -m benchmarks.benchmark_hisparse_eviction_ablation --execution eager --output eager.json
+```
+
+Compare the variants in this order:
+
+| Comparison | What changes |
+| --- | --- |
+| `lru` → `lru-matched` | Cap plain LRU at the smaller hash capacity used by the original age layout. |
+| `lru-matched` → `age-original` | Add the original age strategy at the same hash capacity. |
+| `age-original` → `age-lazy` | Defer Resident-only ageing until the next Hot lookup. |
+| `age-lazy` → `age-grouped` | Classify candidates once, merge by age, and bulk-write the queue when aligned. |
+| `age-grouped` → `age-reuse-ub-matched` | Reuse tag scratch for age at the same hash capacity. |
+| `age-reuse-ub-matched` → `age-reuse-ub` | Allow the hash table to use the recovered UB. |
+| `age-reuse-ub` → `age-vector-age` or `age-gather-mask` | Add vector increments or GatherMask grouping independently. |
+| `age-reuse-ub` → `age-vector-both` | Enable both vector experiments. |
+
+Measure Host KV copies with the actual INT8 C8 gather and use MemFabric if
+the installed HDK requires it:
+
+```bash
+python -m benchmarks.benchmark_hisparse_eviction_ablation --execution graph --measure both \
+  --scenario reuse-plus-scan --variant lru --variant age-reuse-ub
+```
+
+Use `--trace topk.json` to replace the synthetic scenarios with captured
+logical selections from a single request, in a stable token-ID namespace.
+The JSON contains one array per Decode round. A round contains either
+`(MTP+1) * Top-K` flattened IDs or one Top-K array per query. Use `-1` for
+padding. Replay treats the IDs as Host candidates. Repeat `--probation-age`
+to sweep thresholds, for example `--probation-age 1 --probation-age 4`.

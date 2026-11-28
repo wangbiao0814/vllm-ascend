@@ -2,8 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from benchmarks.benchmark_hisparse_eviction import Reference, make_trace
+from benchmarks.benchmark_hisparse_eviction_ablation import load_trace
 
 
 class TestHiSparseEvictionReference(unittest.TestCase):
@@ -33,6 +36,21 @@ class TestHiSparseEvictionReference(unittest.TestCase):
             age.resolve(step)
         self.assertEqual(lru.lookups, age.lookups)
         self.assertGreater(age.hit_rate, lru.hit_rate)
+
+
+class TestAblationTrace(unittest.TestCase):
+    def test_trace_supports_flat_and_per_query_rounds(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.json"
+            path.write_text("[[[1, -1], [2, 3]], [4, 5, 6, 7]]")
+            self.assertEqual(load_trace(path, 2, 2), [[1, -1, 2, 3], [4, 5, 6, 7]])
+
+    def test_trace_rejects_out_of_range_ids(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.json"
+            path.write_text("[[1, 2147483647]]")
+            with self.assertRaisesRegex(ValueError, "int32 IDs"):
+                load_trace(path, 1, 2)
 
 
 if __name__ == "__main__":

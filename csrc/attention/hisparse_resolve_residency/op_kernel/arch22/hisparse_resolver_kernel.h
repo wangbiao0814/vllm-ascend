@@ -11,15 +11,17 @@
 #pragma once
 
 #include "kernel_operator.h"
+#include "../age_options.h"
 #include <cstdint>
 
 struct HiSparseArch22Descriptor {
-    uint64_t pointers[20];
-    uint64_t geometry[27];
+    uint64_t pointers[21];
+    uint64_t geometry[28];
 };
 
 namespace {
 using namespace AscendC;
+using namespace vllm_ascend::hisparse;
 constexpr int32_t kHit = int32_t(0x80000000U);
 constexpr int32_t kMiss = 0x40000000;
 constexpr int32_t kSlotMask = 0xFFFF;
@@ -76,10 +78,13 @@ public:
         tags = tagsBuffer.Get<int32_t>();
         order = orderBuffer.Get<int32_t>();
         io = ioBuffer.Get<int32_t>();
-        if (d.pointers[19]) {
+        if (d.geometry[26]) {
             // The host tiler passes the same aligned size it reserved in UB.
             pipe.InitBuffer(agesBuffer, static_cast<uint32_t>(d.geometry[26]));
             ages = agesBuffer.Get<int16_t>();
+        } else if (d.pointers[19]) {
+            // The mutable tags have already been written before this view is used.
+            ages = tags.ReinterpretCast<int16_t>();
         }
     }
 
@@ -420,20 +425,34 @@ public:
         Sync<HardEvent::MTE2_S>();
     }
 
-    __aicore__ inline void AdvanceAge(int32_t slot)
+    __aicore__ inline int32_t AgeSteps() const
     {
-        int16_t age = ages.GetValue(slot);
-        if (age < INT16_MAX) {
-            ages.SetValue(slot, int16_t(age + 1));
-        }
+        const uint64_t pending = d.pointers[20];
+        if (!pending) return 1;
+        int32_t steps = Read<int32_t>(pending, int64_t(state) * kPendingAgeStride);
+        return steps < INT16_MAX ? steps + 1 : INT16_MAX;
+    }
+
+    __aicore__ inline int16_t AdvanceAge(int32_t slot, int32_t steps)
+    {
+        int32_t age = ages.GetValue(slot) + steps;
+        int16_t next = int16_t(age < INT16_MAX ? age : INT16_MAX);
+        ages.SetValue(slot, next);
+        return next;
     }
 
     __aicore__ inline void AgeResidentRequest()
     {
+        if (d.pointers[20]) {
+            int64_t offset = int64_t(state) * kPendingAgeStride;
+            int32_t pending = Read<int32_t>(d.pointers[20], offset);
+            if (pending < INT16_MAX) Scalar(d.pointers[20], offset, pending + 1);
+            return;
+        }
         LoadTags();
         LoadAges();
         for (int32_t slot = 0; slot < hot; ++slot) {
-            if (tags.GetValue(slot) >= 0) AdvanceAge(slot);
+            if (tags.GetValue(slot) >= 0) AdvanceAge(slot, 1);
         }
         Store(d.pointers[19], int64_t(state) * hot, ages, hot);
     }
@@ -483,6 +502,173 @@ public:
         for (int32_t p = 0; p < hits; ++p) AppendSlot(order.GetValue(p), out);
     }
 
+    __aicore__ inline void WriteGroupedAgeOrder(int32_t hits, int32_t occupied, int32_t empty,
+                                                 int32_t steps, bool vectorAge)
+    {
+        // The first half of order holds hits and reverse-ordered occupied
+        // candidates; the second stores free slots in stable input order.
+        auto slots = order.ReinterpretCast<int16_t>();
+        auto freeSlots = slots[hot];
+        const int32_t usedFree = misses < empty ? misses : empty;
+        const int32_t usedOccupied = misses - usedFree;
+        const int32_t probation = d.geometry[25];
+        // Tags are no longer live. The second half holds the whole result when
+        // DMA aligned, including when the first half backs ages.
+        auto queue = tags.ReinterpretCast<int16_t>()[hot];
+        const bool bulk = hot % 16 == 0;
+        int32_t out = 0;
+        for (int32_t i = usedFree; i < empty; ++i) EmitAgeSlot(queue, bulk, freeSlots.GetValue(i), out);
+        bool inserted = false;
+        for (int32_t i = usedOccupied; i < occupied; ++i) {
+            int32_t slot = slots.GetValue(hot - 1 - i);
+            int16_t age = vectorAge ? ages.GetValue(slot) : AdvanceAge(slot, steps);
+            if (!inserted && age < probation) {
+                EmitRefills(queue, bulk, slots, freeSlots, usedFree, usedOccupied, probation, out);
+                inserted = true;
+            }
+            EmitAgeSlot(queue, bulk, slot, out);
+        }
+        if (!inserted) EmitRefills(queue, bulk, slots, freeSlots, usedFree, usedOccupied, probation, out);
+        for (int32_t p = 0; p < hits; ++p) {
+            int32_t slot = slots.GetValue(p);
+            ages.SetValue(slot, int16_t(0));
+            EmitAgeSlot(queue, bulk, slot, out);
+        }
+        if (bulk) Store(d.pointers[7], int64_t(state) * hot, queue, hot);
+    }
+
+    __aicore__ inline void EmitAgeSlot(LocalTensor<int16_t> queue, bool bulk, int32_t slot, int32_t &out)
+    {
+        if (bulk) queue.SetValue(out++, int16_t(slot));
+        else AppendSlot(slot, out);
+    }
+
+    __aicore__ inline void EmitRefills(LocalTensor<int16_t> queue, bool bulk, LocalTensor<int16_t> slots,
+                                       LocalTensor<int16_t> freeSlots, int32_t usedFree,
+                                       int32_t usedOccupied, int16_t probation, int32_t &out)
+    {
+        for (int32_t i = 0; i < usedFree; ++i) {
+            int32_t slot = freeSlots.GetValue(i);
+            ages.SetValue(slot, probation);
+            EmitAgeSlot(queue, bulk, slot, out);
+        }
+        for (int32_t i = 0; i < usedOccupied; ++i) {
+            int32_t slot = slots.GetValue(hot - 1 - i);
+            ages.SetValue(slot, probation);
+            EmitAgeSlot(queue, bulk, slot, out);
+        }
+    }
+
+    __aicore__ inline void CommitAgeOrder(int32_t hits, int32_t evictable, int32_t empty, uint32_t options)
+    {
+        LoadAges();
+        const int32_t steps = AgeSteps();
+        const bool vectorAge = options & kVectorAge;
+        if (vectorAge) {
+            // Invalid tags make their ages immaterial. Refill and hit ages are
+            // overwritten below. Limit before the int16 add to prevent wrap.
+            Sync<HardEvent::S_V>();
+            Mins(ages, ages, int16_t(INT16_MAX - steps), hot);
+            PipeBarrier<PIPE_V>();
+            Adds(ages, ages, int16_t(steps), hot);
+            Sync<HardEvent::V_S>();
+        }
+        if (options & kGroupCandidates) {
+            WriteGroupedAgeOrder(hits, evictable, empty, steps, vectorAge);
+        } else {
+            for (int32_t p = 0; p < evictable; ++p) {
+                int32_t entry = order.GetValue(hot - 1 - p);
+                if (entry & kRefilledSlot) ages.SetValue(entry & kSlotMask, int16_t(d.geometry[25]));
+                else if (!(entry & kEmptySlot) && !vectorAge) AdvanceAge(entry, steps);
+            }
+            for (int32_t p = 0; p < hits; ++p) ages.SetValue(order.GetValue(p), int16_t(0));
+            WriteAgeOrder(hits, evictable);
+        }
+        Store(d.pointers[19], int64_t(state) * hot, ages, hot);
+        if (d.pointers[20] && steps > 1) {
+            Scalar(d.pointers[20], int64_t(state) * kPendingAgeStride, 0);
+        }
+    }
+
+    __aicore__ inline bool MarkHotHit(int32_t host, int32_t slot)
+    {
+        if (host < 0) return false;
+        int32_t h = Lookup(host);
+        if (h < 0) return false;
+        int32_t value = kHit | slot;
+        if (values.GetValue(h) > value) values.SetValue(h, value);
+        return true;
+    }
+
+    __aicore__ inline bool GatherCandidateGroups(int32_t &hits, int32_t &occupied, int32_t &empty)
+    {
+        // One GatherMask repeat on a 16-bit input consumes 256 bytes.
+        constexpr int32_t kGroupTile = 128;
+        constexpr int32_t kMaskStride = 16;
+        auto input = io.ReinterpretCast<int16_t>();
+        auto packed = input[kGroupTile];
+        auto masks = input[2 * kGroupTile].ReinterpretCast<uint16_t>();
+        auto slots = order.ReinterpretCast<int16_t>();
+        auto freeSlots = slots[hot];
+        GlobalTensor<int16_t> oldOrder;
+        oldOrder.SetGlobalBuffer(reinterpret_cast<__gm__ int16_t *>(d.pointers[7]));
+        GatherMaskParams params;
+        params.repeatTimes = 1;
+        params.src0BlockStride = 1;
+        params.src0RepeatStride = 8;
+        params.src1RepeatStride = 0;
+        for (int32_t base = 0; base < hot; base += kGroupTile) {
+            int32_t size = hot - base < kGroupTile ? hot - base : kGroupTile;
+            DataCopyPad(input, oldOrder[int64_t(state) * hot + base],
+                        DataCopyExtParams{1, uint32_t(size * sizeof(int16_t)), 0, 0, 0},
+                        DataCopyPadExtParams<int16_t>{false, 0, 0, 0});
+            Sync<HardEvent::MTE2_S>();
+            uint16_t hitMask = 0, occupiedMask = 0, emptyMask = 0;
+            int32_t tileCounts[3] = {0, 0, 0};
+            for (int32_t i = 0; i < kGroupTile; ++i) {
+                if (i < size) {
+                    int32_t slot = input.GetValue(i);
+                    if (slot < 0 || slot >= hot) return false;
+                    int32_t host = tags.GetValue(slot);
+                    uint16_t bit = uint16_t(1U << (i % 16));
+                    if (host < 0) {
+                        emptyMask |= bit;
+                        ++tileCounts[2];
+                    } else if (MarkHotHit(host, slot)) {
+                        hitMask |= bit;
+                        ++tileCounts[0];
+                    } else {
+                        occupiedMask |= bit;
+                        ++tileCounts[1];
+                    }
+                }
+                if ((i + 1) % 16 == 0) {
+                    int32_t word = i / 16;
+                    masks.SetValue(word, hitMask);
+                    masks.SetValue(kMaskStride + word, occupiedMask);
+                    masks.SetValue(2 * kMaskStride + word, emptyMask);
+                    hitMask = occupiedMask = emptyMask = 0;
+                }
+            }
+            for (int32_t group = 0; group < 3; ++group) {
+                if (!tileCounts[group]) continue;
+                uint64_t retained = 0;
+                Sync<HardEvent::S_V>();
+                GatherMask(packed, input, masks[group * kMaskStride], false, 0, params, retained);
+                PipeBarrier<PIPE_V>();
+                Sync<HardEvent::V_S>();
+                if (retained != uint64_t(tileCounts[group])) return false;
+                for (int32_t i = 0; i < int32_t(retained); ++i) {
+                    int16_t slot = packed.GetValue(i);
+                    if (group == 0) slots.SetValue(hits++, slot);
+                    else if (group == 1) slots.SetValue(hot - 1 - occupied++, slot);
+                    else freeSlots.SetValue(empty++, slot);
+                }
+            }
+        }
+        return true;
+    }
+
     __aicore__ inline void Process()
     {
         first = GetBlockIdx();
@@ -499,6 +685,8 @@ public:
         }
         bool valid = state >= 0 && state < d.geometry[6] && first < validRows;
         const bool withAge = d.pointers[19] != 0;
+        const uint32_t options = d.geometry[27];
+        const bool grouped = options & kGroupCandidates;
         // Every row can publish its own proven Resident indices. Only the
         // request leader ever mutates Hot state, including on a Resident hit.
         if (valid && PublishResident()) {
@@ -547,24 +735,27 @@ public:
         // evictable/hit partition, halving the hash probes per slot.
         int32_t hits = 0, evictable = 0, empty = 0;
         const uint64_t lruBase = d.pointers[7];
-        for (int32_t p = 0; p < hot; ++p) {
-            int32_t slot = Read<int16_t>(lruBase, int64_t(state) * hot + p);
-            if (slot < 0 || slot >= hot) { error = -1; break; }
-            int32_t host = tags.GetValue(slot);
-            bool hit = false;
-            if (host >= 0) {
-                int32_t h = Lookup(host);
-                if (h >= 0) {
-                    hit = true;
-                    int32_t value = kHit | slot;
-                    if (values.GetValue(h) > value) values.SetValue(h, value);
+        auto groupedSlots = order.ReinterpretCast<int16_t>();
+        auto freeSlots = groupedSlots[hot];
+        if (options & kVectorGrouping) {
+            if (!GatherCandidateGroups(hits, evictable, empty)) error = -1;
+        } else {
+            for (int32_t p = 0; p < hot; ++p) {
+                int32_t slot = Read<int16_t>(lruBase, int64_t(state) * hot + p);
+                if (slot < 0 || slot >= hot) { error = -1; break; }
+                int32_t host = tags.GetValue(slot);
+                bool hit = MarkHotHit(host, slot);
+                if (grouped) {
+                    if (host < 0) freeSlots.SetValue(empty++, int16_t(slot));
+                    else groupedSlots.SetValue(hit ? hits++ : hot - 1 - evictable++, int16_t(slot));
+                } else {
+                    if (withAge && host < 0) {
+                        ++empty;
+                        slot |= kEmptySlot;
+                    }
+                    order.SetValue(hit ? hits++ : hot - 1 - evictable++, slot);
                 }
             }
-            if (withAge && host < 0) {
-                ++empty;
-                slot |= kEmptySlot;
-            }
-            order.SetValue(hit ? hits++ : hot - 1 - evictable++, slot);
         }
         for (int32_t h = 0; h < hashSize; ++h) {
             if (keys.GetValue(h) >= 0 && values.GetValue(h) >= 0) ++misses;
@@ -572,7 +763,6 @@ public:
         if (hits + misses > d.geometry[21] || hits + misses > hot) error = hits + misses;
         if (error) { Publish(true); return; }
 
-        if (withAge) LoadAges();
         int32_t emptyCursor = 0, occupiedCursor = 0;
         int32_t rank = 0, buffered = 0;
         const int64_t swapBase = int64_t(first) * topk;
@@ -583,18 +773,21 @@ public:
                 Translate(Read<int32_t>(logicalBase, int64_t(row) * logicalStride + col), host, device);
                 int32_t h = device < 0 && host >= 0 ? Lookup(host) : -1;
                 if (h >= 0 && values.GetValue(h) == position) {
-                    int32_t orderPosition = hot - 1 - rank;
-                    if (withAge) {
-                        const bool useEmpty = rank < empty;
-                        int32_t &cursor = useEmpty ? emptyCursor : occupiedCursor;
-                        while (bool(order.GetValue(hot - 1 - cursor) & kEmptySlot) != useEmpty) ++cursor;
-                        orderPosition = hot - 1 - cursor++;
-                    }
-                    int32_t entry = order.GetValue(orderPosition);
-                    int32_t slot = entry & kSlotMask;
-                    if (withAge) {
-                        order.SetValue(orderPosition, entry | kRefilledSlot);
-                        ages.SetValue(slot, int16_t(d.geometry[25]));
+                    int32_t slot;
+                    if (grouped) {
+                        slot = rank < empty ? freeSlots.GetValue(rank)
+                                            : groupedSlots.GetValue(hot - 1 - (rank - empty));
+                    } else {
+                        int32_t orderPosition = hot - 1 - rank;
+                        if (withAge) {
+                            const bool useEmpty = rank < empty;
+                            int32_t &cursor = useEmpty ? emptyCursor : occupiedCursor;
+                            while (bool(order.GetValue(hot - 1 - cursor) & kEmptySlot) != useEmpty) ++cursor;
+                            orderPosition = hot - 1 - cursor++;
+                        }
+                        int32_t entry = order.GetValue(orderPosition);
+                        slot = entry & kSlotMask;
+                        if (withAge) order.SetValue(orderPosition, entry | kRefilledSlot);
                     }
                     values.SetValue(h, kMiss | slot);
                     tags.SetValue(slot, host);
@@ -612,13 +805,7 @@ public:
         }
         Store(d.pointers[6], int64_t(state) * hot, tags, hot);
         if (withAge) {
-            for (int32_t p = 0; p < evictable; ++p) {
-                int32_t entry = order.GetValue(hot - 1 - p);
-                if (!(entry & (kEmptySlot | kRefilledSlot))) AdvanceAge(entry);
-            }
-            for (int32_t p = 0; p < hits; ++p) ages.SetValue(order.GetValue(p), int16_t(0));
-            Store(d.pointers[19], int64_t(state) * hot, ages, hot);
-            WriteAgeOrder(hits, evictable);
+            CommitAgeOrder(hits, evictable, empty, options);
             Publish(true);
             return;
         }

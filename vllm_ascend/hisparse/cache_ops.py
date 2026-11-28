@@ -42,6 +42,14 @@ def _load_resolver():
     return namespace
 
 
+# Mirror the native age-mode bits and the DMA-aligned pending row width.
+AGE_GROUP_CANDIDATES = 1
+AGE_REUSE_TAG_SCRATCH = 2
+AGE_VECTOR_INCREMENT = 4
+AGE_VECTOR_GROUPING = 8
+PENDING_AGE_ROW_WIDTH = 8
+
+
 class ResolverWorkspace:
     """Fixed scratch shared by one index group on its ordered copy stream."""
 
@@ -66,12 +74,16 @@ class ResolverWorkspace:
             raise ValueError("HiSparse resolver TopK capacity must be positive and fit the Hot cache")
         self.native = _load_resolver()
         self.ages = None
+        self.pending_age = None
         self.probation_age = probation_age
         if age_state_rows:
-            self.native.hisparse_resolver_validate_scratch(hot_size, max_union_rows, True)
+            self.native.hisparse_resolver_validate_scratch(hot_size, max_union_rows, True, True)
             # Slots with invalid tags never consume stale ages. Refills always
             # replace the age, including after a recycled state row or reset.
             self.ages = torch.zeros((age_state_rows, hot_size), dtype=torch.int16, device=device)
+            # A recycled row with no live tags can retain a pending count:
+            # its first refill overwrites all new ages and consumes the count.
+            self.pending_age = torch.zeros((age_state_rows, PENDING_AGE_ROW_WIDTH), dtype=torch.int32, device=device)
         else:
             self.native.hisparse_resolver_validate_scratch(hot_size, max_union_rows)
         # One resolved Host row per selected token, not per Hot-cache slot.
@@ -275,7 +287,14 @@ class HiSparseNPUOps:
         """
         rows, topk = arguments["global_indices"].shape
         resolved = workspace.first_refs[: rows * topk].view(rows, topk)
-        policy_args = () if workspace.ages is None else (workspace.ages, workspace.probation_age)
+        policy_args = ()
+        if workspace.ages is not None:
+            policy_args = (
+                workspace.ages,
+                workspace.probation_age,
+                workspace.pending_age,
+                AGE_GROUP_CANDIDATES | AGE_REUSE_TAG_SCRATCH,
+            )
         workspace.native.hisparse_resolve_residency(
             arguments["global_indices"],
             arguments["hot_block_table"],

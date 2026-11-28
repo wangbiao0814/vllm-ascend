@@ -1776,7 +1776,7 @@ void hisparse_resolve_residency_meta(
     const std::optional<at::Tensor>&, const std::optional<at::Tensor>&, const std::optional<at::Tensor>&,
     const std::optional<at::Tensor>&, const std::optional<at::Tensor>&, const std::optional<at::Tensor>&,
     int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-    const std::optional<at::Tensor>&, int64_t) {}
+    const std::optional<at::Tensor>&, int64_t, const std::optional<at::Tensor>&, int64_t, int64_t) {}
 
 void npu_indexer_region_score_ids_out_meta(
     const at::Tensor &query, const at::Tensor &weights, const at::Tensor &keySummary,

@@ -5,6 +5,7 @@
 #include "tiling/platform/platform_ascendc.h"
 #include <algorithm>
 #include "../op_kernel/resolver_scratch.h"
+#include "../op_kernel/age_options.h"
 
 namespace optiling {
 namespace {
@@ -23,6 +24,7 @@ constexpr size_t kSwapHostOutput = 7;
 constexpr size_t kSwapDeviceOutput = 8;
 constexpr size_t kSwapCountsOutput = 9;
 constexpr size_t kAgesOutput = 12;
+constexpr size_t kPendingAgeOutput = 13;
 
 constexpr size_t kHostRowsAttr = 0;
 constexpr size_t kHotBlockSizeAttr = 1;
@@ -40,6 +42,8 @@ constexpr size_t kAttentionStrideAttr = 12;
 constexpr size_t kCountsStrideAttr = 13;
 constexpr size_t kByteMissMaskAttr = 14;
 constexpr size_t kProbationAgeAttr = 15;
+constexpr size_t kAgeOptionsAttr = 16;
+constexpr size_t kHashLimitAttr = 17;
 
 ge::graphStatus TileResolve(gert::TilingContext* context,
                             HisparseResolveResidencyTilingData& tiling) {
@@ -120,12 +124,32 @@ ge::graphStatus TileResolve(gert::TilingContext* context,
                           age->GetOriginShape().GetDim(1) != hot),
                 OP_LOGE(context->GetNodeName(), "HiSparse ages require arch22 and must match hot tags."),
                 return ge::GRAPH_FAILED);
+    const auto* pending = context->GetOutputShape(kPendingAgeOutput);
+    const auto* ageOptions = attrs->GetInt(kAgeOptionsAttr);
+    const auto* hashLimit = attrs->GetInt(kHashLimitAttr);
+    const bool withPending = pending != nullptr && pending->GetOriginShape().GetDimNum() != 0;
+    OP_CHECK_IF(ageOptions == nullptr || *ageOptions < 0 || *ageOptions > kAgeOptions ||
+                    (!withAge && (*ageOptions || withPending)) ||
+                    ((*ageOptions & kReuseTagScratch) && !withPending) ||
+                    ((*ageOptions & kVectorAge) && hot % 16 != 0) ||
+                    ((*ageOptions & kVectorGrouping) && !(*ageOptions & kGroupCandidates)),
+                OP_LOGE(context->GetNodeName(), "invalid HiSparse age options."),
+                return ge::GRAPH_FAILED);
+    OP_CHECK_IF(withPending && (pending->GetOriginShape().GetDimNum() != 2 ||
+                    pending->GetOriginShape().GetDim(0) != tagShape.GetDim(0) ||
+                    pending->GetOriginShape().GetDim(1) != kPendingAgeStride),
+                OP_LOGE(context->GetNodeName(), "invalid HiSparse pending-age shape."),
+                return ge::GRAPH_FAILED);
+    OP_CHECK_IF(hashLimit == nullptr || *hashLimit < 0 || (*hashLimit != 0 && (!arch22 || *hashLimit <= *unionRows)),
+                OP_LOGE(context->GetNodeName(), "invalid HiSparse hash limit."),
+                return ge::GRAPH_FAILED);
+    const bool separateAgeUb = withAge && !(*ageOptions & kReuseTagScratch);
     const uint64_t ubBudget = arch22 ? resolver_arch22_ub_budget(platformUbBytes)
                                      : resolver_simt_ub_budget(platformUbBytes);
     OP_CHECK_IF(ubBudget == 0,
                 OP_LOGE(context->GetNodeName(), "platform UB does not cover the resolver reserve."),
                 return ge::GRAPH_FAILED);
-    OP_CHECK_IF(arch22 ? resolver_arch22_scratch_bytes(hot, *unionRows + 1, withAge) > ubBudget
+    OP_CHECK_IF(arch22 ? resolver_arch22_scratch_bytes(hot, *unionRows + 1, separateAgeUb) > ubBudget
                        : resolver_scratch_bytes(hot, *unionRows + 1) > ubBudget,
                 OP_LOGE(context->GetNodeName(),
                         "HiSparse scratch requirement exceeds the platform UB budget; "
@@ -203,9 +227,10 @@ ge::graphStatus TileResolve(gert::TilingContext* context,
                 OP_LOGE(context->GetNodeName(), "failed to query tiling or workspace."),
                 return ge::GRAPH_FAILED);
 
-    const uint64_t hashSize = arch22 ? resolver_arch22_hash_capacity(hot, *unionRows, ubBudget, withAge)
-                                     : resolver_hash_capacity(hot, *unionRows, ubBudget);
-    const uint32_t ubBytes = static_cast<uint32_t>(arch22 ? resolver_arch22_scratch_bytes(hot, hashSize, withAge)
+    const uint64_t capacity = arch22 ? resolver_arch22_hash_capacity(hot, *unionRows, ubBudget, separateAgeUb)
+                                      : resolver_hash_capacity(hot, *unionRows, ubBudget);
+    const uint64_t hashSize = *hashLimit ? std::min(capacity, static_cast<uint64_t>(*hashLimit)) : capacity;
+    const uint32_t ubBytes = static_cast<uint32_t>(arch22 ? resolver_arch22_scratch_bytes(hot, hashSize, separateAgeUb)
                                                           : resolver_scratch_bytes(hot, hashSize));
     if (!arch22) {
         // Only the SIMT kernel declares dynamic local memory; the arch22
@@ -227,7 +252,8 @@ ge::graphStatus TileResolve(gert::TilingContext* context,
     tiling.set_hashSize(hashSize);
     tiling.set_ubBytes(ubBytes);
     tiling.set_probationAge(*probationAge);
-    tiling.set_ageUbBytes(static_cast<uint32_t>(resolver_arch22_age_bytes(hot, withAge)));
+    tiling.set_ageUbBytes(static_cast<uint32_t>(resolver_arch22_age_bytes(hot, separateAgeUb)));
+    tiling.set_ageOptions(*ageOptions);
 
     tiling.set_hostRows(*hostRows);
     tiling.set_hotBlockSize(*hotBlockSize);

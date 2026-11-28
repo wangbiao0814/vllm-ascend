@@ -31,6 +31,7 @@ extern "C" __global__ __aicore__ void hisparse_resolve_residency(
     GM_ADDR miss_mask,
     GM_ADDR stats,
     GM_ADDR ages,
+    GM_ADDR pending_age,
     GM_ADDR workspace, GM_ADDR tiling) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     GET_TILING_DATA(tilingData, tiling);
@@ -84,6 +85,8 @@ extern "C" __global__ __aicore__ void hisparse_resolve_residency(
     descriptor.geometry[24] = tilingData.byteMissMask;
     descriptor.geometry[25] = tilingData.probationAge;
     descriptor.geometry[26] = tilingData.ageUbBytes;
+    descriptor.geometry[27] = tilingData.ageOptions;
+    descriptor.pointers[20] = reinterpret_cast<uintptr_t>(pending_age);
     AscendC::TPipe pipe;
     Resolver resolver(descriptor, pipe);
     resolver.Process();
@@ -114,12 +117,14 @@ extern "C" __global__ __aicore__ void hisparse_resolve_residency(
     GM_ADDR miss_mask,
     GM_ADDR stats,
     GM_ADDR ages,
+    GM_ADDR pending_age,
     GM_ADDR workspace, GM_ADDR tiling) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     GET_TILING_DATA(tilingData, tiling);
     (void)workspace;
 
     (void)ages;
+    (void)pending_age;
     // Allocate the SIMT scratch dynamically through the standard UB interface;
     // the tiling stage derives the byte budget from GetCoreMemSize. The
     // descriptor sits at the low end of the allocation and the scratch area
