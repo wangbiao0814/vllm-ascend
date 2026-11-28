@@ -1106,11 +1106,18 @@ def _describe_artifacts(root: Path, artifact_paths: Sequence[str]) -> list[dict]
     for relative in sorted(set(artifact_paths)):
         source = root / relative
         if source.is_symlink():
+            target = os.readlink(source)
+            if os.path.isabs(target):
+                internal_target = _internal_symlink_target(root, source)
+                if internal_target is not None:
+                    # The cache and shared output have different roots from
+                    # the private stage. Keep in-tree links within each copy.
+                    target = os.path.relpath(internal_target, source.parent)
             artifacts.append(
                 {
                     "path": relative,
                     "kind": "symlink",
-                    "target": os.readlink(source),
+                    "target": target,
                 }
             )
             continue

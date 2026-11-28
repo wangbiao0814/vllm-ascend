@@ -1086,6 +1086,49 @@ def test_third_party_symlink_restores_link_and_internal_target(tmp_path: Path):
     assert os.access(protoc, os.X_OK)
 
 
+def test_absolute_stage_symlink_survives_cache_restore_and_retirement(tmp_path: Path):
+    engine = _load_engine("stage_symlink_cache")
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    binary = stage / "kernel.o"
+    binary.write_text("v1")
+    link = stage / "kernel"
+    link.symlink_to(binary)
+    artifacts = engine._describe_artifacts(stage, engine._collect_artifacts(stage, {}, ["kernel"]))
+    entry = tmp_path / "entry"
+    engine._save_entry(entry, stage, artifacts, {"final_key": "key"})
+
+    publish = tmp_path / "published"
+    state = tmp_path / "state"
+    engine._publish_action_artifacts(
+        source_root=stage,
+        publish_dir=publish,
+        publish_state_dir=state,
+        action_identity="hisparse/0",
+        artifacts=artifacts,
+    )
+
+    shutil.rmtree(stage)
+    assert os.readlink(publish / "kernel") == "kernel.o"
+    assert (publish / "kernel").read_text() == "v1"
+    restored = tmp_path / "restored"
+    engine._restore_entry(entry, restored, {"artifacts": artifacts})
+    assert os.readlink(restored / "kernel") == "kernel.o"
+    assert (restored / "kernel").read_text() == "v1"
+
+    (restored / "replacement.o").write_text("v2")
+    engine._publish_action_artifacts(
+        source_root=restored,
+        publish_dir=publish,
+        publish_state_dir=state,
+        action_identity="hisparse/0",
+        artifacts=engine._describe_artifacts(restored, ["replacement.o"]),
+    )
+    assert not (publish / "kernel").is_symlink()
+    assert not (publish / "kernel.o").exists()
+    assert (publish / "replacement.o").read_text() == "v2"
+
+
 def test_corrupted_cached_symlink_rebuilds(tmp_path: Path):
     prepared = tmp_path / "prepared"
     prepared.mkdir()
