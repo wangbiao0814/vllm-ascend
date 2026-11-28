@@ -767,7 +767,8 @@ public:
         int32_t rank = 0, buffered = 0;
         const int64_t swapBase = int64_t(first) * topk;
         position = 0;
-        for (int32_t row = first; row < end; ++row) {
+        // With no misses the existing Hot bindings already resolve the union.
+        for (int32_t row = first; misses != 0 && row < end; ++row) {
             for (int32_t col = 0; col < topk; ++col) {
                 int32_t host, device;
                 Translate(Read<int32_t>(logicalBase, int64_t(row) * logicalStride + col), host, device);
@@ -803,7 +804,7 @@ public:
                 ++position;
             }
         }
-        Store(d.pointers[6], int64_t(state) * hot, tags, hot);
+        if (misses != 0) Store(d.pointers[6], int64_t(state) * hot, tags, hot);
         if (withAge) {
             CommitAgeOrder(hits, evictable, empty, options);
             Publish(true);
