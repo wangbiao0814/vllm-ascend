@@ -62,6 +62,12 @@ __aicore__ inline void Store(uint64_t address, int64_t offset, LocalTensor<T> da
     }
 }
 
+struct PublishCursor {
+    int32_t base = 0;
+    int32_t count = 0;
+    int32_t compactCount = 0;
+};
+
 class Resolver {
 public:
     __aicore__ inline Resolver(const HiSparseArch22Descriptor &descriptor, TPipe &pipe) : d(descriptor)
@@ -417,6 +423,7 @@ public:
         Sync<HardEvent::MTE2_S>();
     }
 
+    template <bool WaitForCompletion = true>
     __aicore__ inline void LoadAges()
     {
         GlobalTensor<int16_t> globalAges;
@@ -424,7 +431,7 @@ public:
         DataCopyPad(ages, globalAges[int64_t(state) * hot],
                     DataCopyExtParams{1, uint32_t(hot * sizeof(int16_t)), 0, 0, 0},
                     DataCopyPadExtParams<int16_t>{false, 0, 0, 0});
-        Sync<HardEvent::MTE2_S>();
+        if constexpr (WaitForCompletion) Sync<HardEvent::MTE2_S>();
     }
 
     __aicore__ inline int32_t AgeSteps() const
@@ -574,48 +581,120 @@ public:
         }
     }
 
-    __aicore__ inline void PrepareDenseRefillAges(int32_t occupied, int32_t empty, int32_t steps)
+    __aicore__ inline void SaveSurvivorAges(int32_t occupied, int32_t empty,
+                                             int32_t usedOccupied, int32_t steps)
     {
-        const int32_t usedOccupied = misses > empty ? misses - empty : 0;
-        if (usedOccupied < occupied) {
-            LoadAges();
-            auto slots = order.ReinterpretCast<int16_t>();
-            auto freeSlots = slots[hot];
-            // Preserve advanced ages beyond the live free list. Empty and
-            // occupied candidates are disjoint, so empty + occupied <= hot.
-            for (int32_t i = usedOccupied; i < occupied; ++i) {
-                int32_t slot = slots.GetValue(hot - 1 - i);
-                freeSlots.SetValue(empty + i, ReadAdvancedAge(slot, steps));
-            }
+        auto slots = order.ReinterpretCast<int16_t>();
+        auto freeSlots = slots[hot];
+        // Empty and occupied candidates are disjoint, so empty + occupied <= hot.
+        for (int32_t i = usedOccupied; i < occupied; ++i) {
+            int32_t slot = slots.GetValue(hot - 1 - i);
+            freeSlots.SetValue(empty + i, ReadAdvancedAge(slot, steps));
         }
-        // No previous age is needed when every valid slot is hit or refilled.
-        Sync<HardEvent::S_V>();
-        Duplicate(ages, int16_t(d.geometry[25]), hot);
-        Sync<HardEvent::V_S>();
     }
 
-    __aicore__ inline void CommitAgeOrder(int32_t hits, int32_t evictable, int32_t empty, uint32_t options)
+    __aicore__ inline void StartVectorAgeUpdate(bool denseRefill, int32_t steps)
     {
-        const int32_t steps = AgeSteps();
-        const bool vectorAge = options & kVectorAge;
-        const int32_t usedOccupied = misses > empty ? misses - empty : 0;
-        const int32_t survivors = evictable - usedOccupied;
-        // Bulk initialization pays off only when refills dominate the extra
-        // pass over survivors. Keep the scalar path for sparse refills.
-        const bool denseRefill = (options & kDenseRefillAge) && hot % 16 == 0 &&
-                                 misses >= hot / 2 && misses >= 2 * survivors;
-        if (denseRefill) PrepareDenseRefillAges(evictable, empty, steps);
-        else LoadAges();
-        if (vectorAge) {
-            // Invalid tags make their ages immaterial. Refill and hit ages are
-            // overwritten below. Limit before the int16 add to prevent wrap.
-            Sync<HardEvent::S_V>();
+        Sync<HardEvent::S_V>();
+        if (denseRefill) {
+            Duplicate(ages, int16_t(d.geometry[25]), hot);
+        } else {
+            // Limit before the int16 add to prevent wrap.
             Mins(ages, ages, int16_t(INT16_MAX - steps), hot);
             PipeBarrier<PIPE_V>();
             Adds(ages, ages, int16_t(steps), hot);
+        }
+    }
+
+    __aicore__ inline int32_t FindAgeSplit(int32_t usedOccupied, int32_t occupied, int32_t steps)
+    {
+        // Survivor ages remain non-increasing in the old queue. Advancing
+        // uniformly preserves this order even when some ages saturate.
+        int32_t threshold = static_cast<int32_t>(d.geometry[25]) - steps;
+        if (threshold <= 0) return occupied;
+        auto slots = order.ReinterpretCast<int16_t>();
+        int32_t lo = usedOccupied, hi = occupied;
+        while (lo < hi) {
+            int32_t mid = lo + (hi - lo) / 2;
+            if (ages.GetValue(slots.GetValue(hot - 1 - mid)) >= threshold) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
+    }
+
+    __aicore__ inline void StoreSplitAgeOrder(int32_t hits, int32_t occupied, int32_t empty,
+                                               int32_t usedFree, int32_t usedOccupied, int32_t split)
+    {
+        auto slots = order.ReinterpretCast<int16_t>();
+        auto freeSlots = slots[hot];
+        // The first half of tags may be under vector update through ages.
+        // Only this aligned second half is written here.
+        auto queue = tags.ReinterpretCast<int16_t>()[hot];
+        int32_t out = 0;
+        for (int32_t i = usedFree; i < empty; ++i) queue.SetValue(out++, freeSlots.GetValue(i));
+        for (int32_t i = usedOccupied; i < split; ++i) queue.SetValue(out++, slots.GetValue(hot - 1 - i));
+        EmitRefills<true>(queue, true, slots, freeSlots, usedFree, usedOccupied, 0, out);
+        for (int32_t i = split; i < occupied; ++i) queue.SetValue(out++, slots.GetValue(hot - 1 - i));
+        for (int32_t i = 0; i < hits; ++i) queue.SetValue(out++, slots.GetValue(i));
+        Store(d.pointers[7], int64_t(state) * hot, queue, hot);
+    }
+
+    __aicore__ inline void FinishSplitAges(int32_t hits, int32_t occupied, int32_t empty,
+                                            int32_t usedFree, int32_t usedOccupied, bool denseRefill)
+    {
+        auto slots = order.ReinterpretCast<int16_t>();
+        auto freeSlots = slots[hot];
+        if (denseRefill) {
+            for (int32_t i = usedOccupied; i < occupied; ++i) {
+                ages.SetValue(slots.GetValue(hot - 1 - i), freeSlots.GetValue(empty + i));
+            }
+        } else {
+            int16_t probation = d.geometry[25];
+            for (int32_t i = 0; i < usedFree; ++i) ages.SetValue(freeSlots.GetValue(i), probation);
+            for (int32_t i = 0; i < usedOccupied; ++i) ages.SetValue(slots.GetValue(hot - 1 - i), probation);
+        }
+        for (int32_t i = 0; i < hits; ++i) ages.SetValue(slots.GetValue(i), int16_t(0));
+    }
+
+    __aicore__ inline void CommitAgeOrder(int32_t hits, int32_t evictable, int32_t empty,
+                                          uint32_t options, PublishCursor &cursor)
+    {
+        const int32_t steps = AgeSteps();
+        const bool vectorAge = options & kVectorAge;
+        const int32_t usedFree = misses < empty ? misses : empty;
+        const int32_t usedOccupied = misses - usedFree;
+        const int32_t survivors = evictable - usedOccupied;
+        // Keep the scalar path when the dense threshold does not pay off.
+        const bool denseRefill = (options & kDenseRefillAge) && hot % 16 == 0 &&
+                                 misses >= hot / 2 && misses >= 2 * survivors;
+        const bool splitOrder = (options & kSplitAgeOrder) && (denseRefill || vectorAge);
+        if (!denseRefill || survivors != 0) {
+            if (options & kOverlapAgeRead) {
+                LoadAges<false>();
+                // The index tile uses hash state and io; neither aliases ages.
+                PublishTiles(true, first, kTile < topk ? kTile : topk, cursor);
+                Sync<HardEvent::MTE2_S>();
+            } else {
+                LoadAges();
+            }
+        }
+
+        int32_t split = evictable;
+        if (splitOrder) split = FindAgeSplit(usedOccupied, evictable, steps);
+        if (denseRefill) SaveSurvivorAges(evictable, empty, usedOccupied, steps);
+        if (denseRefill || vectorAge) {
+            StartVectorAgeUpdate(denseRefill, steps);
+            if (splitOrder && (options & kOverlapAgeUpdate)) {
+                StoreSplitAgeOrder(hits, evictable, empty, usedFree, usedOccupied, split);
+            }
             Sync<HardEvent::V_S>();
         }
-        if (denseRefill) {
+        if (splitOrder) {
+            if (!(options & kOverlapAgeUpdate)) {
+                StoreSplitAgeOrder(hits, evictable, empty, usedFree, usedOccupied, split);
+            }
+            FinishSplitAges(hits, evictable, empty, usedFree, usedOccupied, denseRefill);
+        } else if (denseRefill) {
             WriteGroupedAgeOrder<true>(hits, evictable, empty, steps, false);
         } else if (options & kGroupCandidates) {
             WriteGroupedAgeOrder<false>(hits, evictable, empty, steps, vectorAge);
@@ -635,8 +714,8 @@ public:
             Scalar(d.pointers[20], int64_t(state) * kPendingAgeStride, 0);
         }
         if (asyncWriteback) {
-            // Publish computes its first index tile in io without reusing ages.
-            // Its first synchronous MTE3 store also drains this earlier write.
+            // The next index tile in io can be computed while this write runs.
+            // The next synchronous MTE3 store, at latest the row status, drains it.
             Store<int16_t, false>(d.pointers[19], ageOffset, ages, hot);
         }
     }
@@ -857,8 +936,9 @@ public:
         }
         if (misses != 0) Store(d.pointers[6], int64_t(state) * hot, tags, hot);
         if (withAge) {
-            CommitAgeOrder(hits, evictable, empty, options);
-            Publish(true);
+            PublishCursor cursor;
+            CommitAgeOrder(hits, evictable, empty, options, cursor);
+            Publish(true, cursor);
             return;
         }
         int32_t remaining = hot - hits - misses;
@@ -876,7 +956,7 @@ public:
         Publish(true);
     }
 
-    __aicore__ inline void Publish(bool valid)
+    __aicore__ inline void PublishTiles(bool valid, int32_t row, int32_t stop, PublishCursor &cursor)
     {
         // Recompute translations; never read another program's output or
         // scalar-cache data that has just been updated by MTE3. Descriptor
@@ -895,76 +975,84 @@ public:
         const int64_t attentionCapacity = d.geometry[23];
         const uint64_t maskOut = d.pointers[15];
         const bool byteMask = d.geometry[24] != 0;
-        for (int32_t row = first; row < end; ++row) {
-            int32_t count = 0, compactCount = 0;
-            for (int32_t base = 0; base < topk; base += kTile) {
-                int32_t extent = topk - base < kTile ? topk - base : kTile;
+        for (int32_t base = cursor.base; base < stop; base += kTile) {
+            int32_t extent = topk - base < kTile ? topk - base : kTile;
+            for (int32_t i = 0; i < extent; ++i) {
+                int32_t host = -1, device = -1;
+                if (valid) Translate(Read<int32_t>(logicalBase, int64_t(row) * logicalStride + base + i), host, device);
+                io.SetValue(kTile + i, host);
+                if (valid && !error && device < 0 && host >= 0) {
+                    int32_t h = Lookup(host);
+                    device = h >= 0 ? Physical(values.GetValue(h) & kSlotMask) : -1;
+                }
+                if (error) device = -1;
+                io.SetValue(i, device);
+                cursor.count += device >= 0;
+            }
+            Store(deviceOut, int64_t(row) * topk + base, io, extent);
+            Store(hostOut, int64_t(row) * topk + base, io[kTile], extent);
+            if (attentionOut) {
+                int32_t kept = 0;
                 for (int32_t i = 0; i < extent; ++i) {
-                    int32_t host = -1, device = -1;
-                    if (valid) Translate(Read<int32_t>(logicalBase, int64_t(row) * logicalStride + base + i), host, device);
-                    io.SetValue(kTile + i, host);
-                    if (valid && !error && device < 0 && host >= 0) {
-                        int32_t h = Lookup(host);
-                        device = h >= 0 ? Physical(values.GetValue(h) & kSlotMask) : -1;
-                    }
-                    if (error) device = -1;
-                    io.SetValue(i, device);
-                    count += device >= 0;
+                    int32_t device = io.GetValue(i);
+                    int64_t mapped = device < 0 ? -1 :
+                        int64_t(device / blockSpan) * attentionGap + device % blockSpan;
+                    if (!compact) io.SetValue(i, mapped);
+                    else if (mapped >= 0 && mapped < attentionCapacity) io.SetValue(kept++, mapped);
                 }
-                Store(deviceOut, int64_t(row) * topk + base, io, extent);
-                Store(hostOut, int64_t(row) * topk + base, io[kTile], extent);
-                if (attentionOut) {
-                    int32_t kept = 0;
-                    for (int32_t i = 0; i < extent; ++i) {
-                        int32_t device = io.GetValue(i);
-                        int64_t mapped = device < 0 ? -1 :
-                            int64_t(device / blockSpan) * attentionGap + device % blockSpan;
-                        if (!compact) io.SetValue(i, mapped);
-                        else if (mapped >= 0 && mapped < attentionCapacity) io.SetValue(kept++, mapped);
-                    }
-                    if (compact) {
-                        // Keep order and duplicates; only Attention is compacted.
-                        // Virtual indices and the refill plan retain their ABI.
-                        Store(attentionOut, int64_t(row) * attentionStride + compactCount, io, kept);
-                        compactCount += kept;
-                    } else {
-                        Store(attentionOut, int64_t(row) * attentionStride + base, io, extent);
-                    }
-                }
-                // The Core compact plan is the primary interface. Optional
-                // masks identify only the first occurrence of each miss.
-                if (maskOut) {
-                    for (int32_t i = 0; i < extent; ++i) {
-                        int32_t host = io.GetValue(kTile + i);
-                        int32_t h = valid && !error && host >= 0 ? Lookup(host) : -1;
-                        bool miss = h >= 0 && (values.GetValue(h) & kMiss) && values.GetValue(h) >= 0;
-                        // Repeated references must not submit duplicate copies.
-                        if (miss) {
-                            for (int32_t earlier = first; earlier <= row && miss; ++earlier) {
-                                int32_t limit = earlier == row ? base + i : topk;
-                                for (int32_t col = 0; col < limit; ++col) {
-                                    int32_t oldHost, oldDevice;
-                                    Translate(Read<int32_t>(logicalBase, int64_t(earlier) * logicalStride + col), oldHost, oldDevice);
-                                    if (oldDevice < 0 && oldHost == host) { miss = false; break; }
-                                }
-                            }
-                        }
-                        if (byteMask) io.ReinterpretCast<uint8_t>().SetValue(i, uint8_t(miss));
-                        else io.SetValue(i, int32_t(miss));
-                    }
-                    if (byteMask) Store(maskOut, int64_t(row) * topk + base, io.ReinterpretCast<uint8_t>(), extent);
-                    else Store(maskOut, int64_t(row) * topk + base, io, extent);
+                if (compact) {
+                    // Keep order and duplicates; only Attention is compacted.
+                    // Virtual indices and the refill plan retain their ABI.
+                    Store(attentionOut, int64_t(row) * attentionStride + cursor.compactCount, io, kept);
+                    cursor.compactCount += kept;
+                } else {
+                    Store(attentionOut, int64_t(row) * attentionStride + base, io, extent);
                 }
             }
+            // The Core compact plan is the primary interface. Optional
+            // masks identify only the first occurrence of each miss.
+            if (maskOut) {
+                for (int32_t i = 0; i < extent; ++i) {
+                    int32_t host = io.GetValue(kTile + i);
+                    int32_t h = valid && !error && host >= 0 ? Lookup(host) : -1;
+                    bool miss = h >= 0 && (values.GetValue(h) & kMiss) && values.GetValue(h) >= 0;
+                    // Repeated references must not submit duplicate copies.
+                    if (miss) {
+                        for (int32_t earlier = first; earlier <= row && miss; ++earlier) {
+                            int32_t limit = earlier == row ? base + i : topk;
+                            for (int32_t col = 0; col < limit; ++col) {
+                                int32_t oldHost, oldDevice;
+                                Translate(Read<int32_t>(logicalBase, int64_t(earlier) * logicalStride + col), oldHost, oldDevice);
+                                if (oldDevice < 0 && oldHost == host) { miss = false; break; }
+                            }
+                        }
+                    }
+                    if (byteMask) io.ReinterpretCast<uint8_t>().SetValue(i, uint8_t(miss));
+                    else io.SetValue(i, int32_t(miss));
+                }
+                if (byteMask) Store(maskOut, int64_t(row) * topk + base, io.ReinterpretCast<uint8_t>(), extent);
+                else Store(maskOut, int64_t(row) * topk + base, io, extent);
+            }
+        }
+        cursor.base = stop;
+    }
+
+    __aicore__ inline void Publish(bool valid, PublishCursor cursor = {})
+    {
+        const bool compact = d.geometry[23] != 0;
+        const uint64_t attentionOut = d.pointers[9];
+        const int64_t attentionStride = d.geometry[18];
+        for (int32_t row = first; row < end; ++row) {
+            PublishTiles(valid, row, topk, cursor);
             if (compact) {
                 for (int32_t i = 0; i < kTile; ++i) io.SetValue(i, -1);
-                for (int32_t base = compactCount; base < topk; base += kTile) {
+                for (int32_t base = cursor.compactCount; base < topk; base += kTile) {
                     int32_t extent = topk - base < kTile ? topk - base : kTile;
                     Store(attentionOut, int64_t(row) * attentionStride + base, io, extent);
                 }
-                count = compactCount;
+                cursor.count = cursor.compactCount;
             }
-            Scalar(d.pointers[11], int64_t(row) * d.geometry[20], count);
+            Scalar(d.pointers[11], int64_t(row) * d.geometry[20], cursor.count);
             int32_t swaps = misses - (row - first) * topk;
             swaps = swaps < 0 ? 0 : (swaps > topk ? topk : swaps);
             Scalar(d.pointers[14], row, error ? 0 : swaps);
@@ -975,6 +1063,7 @@ public:
                 io.SetValue(2, error ? 0 : misses);
             }
             Store(d.pointers[17], int64_t(row) * 8, io, 8);
+            cursor = PublishCursor{};
         }
     }
 

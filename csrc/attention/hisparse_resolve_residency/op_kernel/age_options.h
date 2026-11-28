@@ -10,8 +10,12 @@ inline constexpr uint32_t kVectorAge = 4;
 inline constexpr uint32_t kVectorGrouping = 8;
 inline constexpr uint32_t kDenseRefillAge = 16;
 inline constexpr uint32_t kAsyncAgeWriteback = 32;
+inline constexpr uint32_t kSplitAgeOrder = 64;
+inline constexpr uint32_t kOverlapAgeRead = 128;
+inline constexpr uint32_t kOverlapAgeUpdate = 256;
 inline constexpr uint32_t kAgeOptions =
-    kGroupCandidates | kReuseTagScratch | kVectorAge | kVectorGrouping | kDenseRefillAge | kAsyncAgeWriteback;
+    kGroupCandidates | kReuseTagScratch | kVectorAge | kVectorGrouping | kDenseRefillAge | kAsyncAgeWriteback |
+    kSplitAgeOrder | kOverlapAgeRead | kOverlapAgeUpdate;
 // Pad request rows to one DMA block so concurrent leaders cannot share it.
 inline constexpr uint32_t kPendingAgeStride = 8;
 }  // namespace vllm_ascend::hisparse

@@ -2,11 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from benchmarks.benchmark_hisparse_eviction import Reference, make_hit_rate_trace, make_trace
 from benchmarks.benchmark_hisparse_eviction_ablation import (
+    PIPELINE_CONTROLS,
+    VARIANTS,
     add_latency_deltas,
     expand_request_trace,
     load_trace,
@@ -44,6 +47,13 @@ class TestHiSparseEvictionReference(unittest.TestCase):
 
 
 class TestAblationTrace(unittest.TestCase):
+    def test_each_pipeline_variant_changes_only_its_target_stage(self):
+        for suffix, field in (("read", "overlap_read"), ("update", "overlap_update"), ("write", "async_writeback")):
+            variant_name = f"age-dense-overlap-{suffix}"
+            with self.subTest(suffix=suffix):
+                control = VARIANTS[PIPELINE_CONTROLS[variant_name]]
+                self.assertEqual(VARIANTS[variant_name], replace(control, **{field: True}))
+
     def test_writeback_delta_uses_the_matching_control(self):
         row = {"resolver_us": 98.0, "combined_us": 145.0}
         control = {"resolver_us": 100.0, "combined_us": 150.0}

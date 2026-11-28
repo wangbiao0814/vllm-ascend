@@ -396,3 +396,35 @@ the asynchronous variant against the synchronous `writeback_control`.
 Negative values indicate a reduction in time. The measured difference
 includes the synchronization change. The number of age bytes transferred
 stays the same within each pair.
+
+#### Age read, update and write overlap
+
+Run these variants to isolate overlap with the same C8 workload, hash
+capacity and victim order. Rebuild the custom OPP before testing.
+
+| Variant | Control | Change |
+| --- | --- | --- |
+| `age-dense-split` | `age-dense-refill` | Find the insertion point from old ages and build the queue separately. |
+| `age-dense-overlap-read` | `age-dense-split` | Publish the first index tile while the old age row loads. |
+| `age-dense-overlap-update` | `age-dense-split` | Build and store the queue while the vector age initialization runs. |
+| `age-dense-overlap-write` | `age-dense-split` | Write the age row while producing the next index tile. |
+| `age-dense-overlap-all` | `age-dense-split` | Enable the three overlap stages. |
+| `age-vector-split` | `age-vector-age` | Separate queue construction from vector saturating increments. |
+| `age-vector-overlap-all` | `age-vector-split` | Enable all stages for vector saturating increments. |
+
+```bash
+python -m benchmarks.benchmark_hisparse_eviction_ablation \
+  --execution graph --mtp 3 --requests 1 --measure both \
+  --hit-rate 0 --hit-rate 0.1 --hit-rate 0.25 --hit-rate 0.5 \
+  --variant age-dense-refill --variant age-dense-split \
+  --variant age-dense-overlap-read --variant age-dense-overlap-update \
+  --variant age-dense-overlap-write --variant age-dense-overlap-all \
+  --output age-pipeline-graph.json
+```
+
+Compare `pipeline_resolver_delta_us` and `pipeline_combined_delta_us` against
+`pipeline_control`. At 50% hits, MTP-3 with the default Hot size typically
+uses the scalar fallback. It measures the read and write changes without
+dense vector initialization. The read stage is skipped when no survivor
+needs its original age. The age load still starts after the tag write
+completes, because both use the same UB storage.

@@ -16,7 +16,10 @@ from vllm_ascend.hisparse.cache_ops import (
     AGE_ASYNC_WRITEBACK,
     AGE_DENSE_REFILL,
     AGE_GROUP_CANDIDATES,
+    AGE_OVERLAP_READ,
+    AGE_OVERLAP_UPDATE,
     AGE_REUSE_TAG_SCRATCH,
+    AGE_SPLIT_ORDER,
     AGE_VECTOR_GROUPING,
     AGE_VECTOR_INCREMENT,
     HiSparseNPUOps,
@@ -1128,6 +1131,26 @@ def test_union_overflow_preserves_state(capture, compact):
         (32767, 0),
         (4, AGE_GROUP_CANDIDATES | AGE_REUSE_TAG_SCRATCH | AGE_ASYNC_WRITEBACK),
         (4, AGE_GROUP_CANDIDATES | AGE_REUSE_TAG_SCRATCH | AGE_DENSE_REFILL | AGE_ASYNC_WRITEBACK),
+        (
+            4,
+            AGE_GROUP_CANDIDATES
+            | AGE_REUSE_TAG_SCRATCH
+            | AGE_DENSE_REFILL
+            | AGE_SPLIT_ORDER
+            | AGE_OVERLAP_READ
+            | AGE_OVERLAP_UPDATE
+            | AGE_ASYNC_WRITEBACK,
+        ),
+        (
+            4,
+            AGE_GROUP_CANDIDATES
+            | AGE_REUSE_TAG_SCRATCH
+            | AGE_VECTOR_INCREMENT
+            | AGE_SPLIT_ORDER
+            | AGE_OVERLAP_READ
+            | AGE_OVERLAP_UPDATE
+            | AGE_ASYNC_WRITEBACK,
+        ),
     ],
 )
 def test_eviction_policy_mtp3_graph_replays(probation, options):

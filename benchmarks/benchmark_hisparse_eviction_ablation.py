@@ -7,7 +7,7 @@ from __future__ import annotations
 import argparse
 import json
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from benchmarks.benchmark_hisparse_eviction import SCENARIOS, NativeResolver, Reference, make_hit_rate_trace, make_trace
@@ -24,6 +24,9 @@ class Variant:
     gather_mask: bool = False
     dense_refill: bool = False
     async_writeback: bool = False
+    split_order: bool = False
+    overlap_read: bool = False
+    overlap_update: bool = False
 
     @property
     def options(self):
@@ -31,7 +34,10 @@ class Variant:
             AGE_ASYNC_WRITEBACK,
             AGE_DENSE_REFILL,
             AGE_GROUP_CANDIDATES,
+            AGE_OVERLAP_READ,
+            AGE_OVERLAP_UPDATE,
             AGE_REUSE_TAG_SCRATCH,
+            AGE_SPLIT_ORDER,
             AGE_VECTOR_GROUPING,
             AGE_VECTOR_INCREMENT,
         )
@@ -43,6 +49,9 @@ class Variant:
             | (AGE_VECTOR_GROUPING if self.gather_mask else 0)
             | (AGE_DENSE_REFILL if self.dense_refill else 0)
             | (AGE_ASYNC_WRITEBACK if self.async_writeback else 0)
+            | (AGE_SPLIT_ORDER if self.split_order else 0)
+            | (AGE_OVERLAP_READ if self.overlap_read else 0)
+            | (AGE_OVERLAP_UPDATE if self.overlap_update else 0)
         )
 
 
@@ -62,6 +71,30 @@ VARIANTS = {
     "age-vector-both": Variant(grouped=True, reuse_ub=True, vector_age=True, gather_mask=True),
 }
 
+
+DENSE_SPLIT = replace(VARIANTS["age-dense-refill"], split_order=True)
+VECTOR_SPLIT = replace(VARIANTS["age-vector-age"], split_order=True)
+VARIANTS.update(
+    {
+        "age-dense-split": DENSE_SPLIT,
+        "age-dense-overlap-read": replace(DENSE_SPLIT, overlap_read=True),
+        "age-dense-overlap-update": replace(DENSE_SPLIT, overlap_update=True),
+        "age-dense-overlap-write": replace(DENSE_SPLIT, async_writeback=True),
+        "age-dense-overlap-all": replace(DENSE_SPLIT, overlap_read=True, overlap_update=True, async_writeback=True),
+        "age-vector-split": VECTOR_SPLIT,
+        "age-vector-overlap-all": replace(VECTOR_SPLIT, overlap_read=True, overlap_update=True, async_writeback=True),
+    }
+)
+
+PIPELINE_CONTROLS = {
+    "age-dense-split": "age-dense-refill",
+    "age-dense-overlap-read": "age-dense-split",
+    "age-dense-overlap-update": "age-dense-split",
+    "age-dense-overlap-write": "age-dense-split",
+    "age-dense-overlap-all": "age-dense-split",
+    "age-vector-split": "age-vector-age",
+    "age-vector-overlap-all": "age-vector-split",
+}
 
 WRITEBACK_CONTROLS = {
     "age-async-write": "age-reuse-ub",
@@ -223,12 +256,13 @@ def run_scenario(args, name, trace, hot_size, queries, probation, variants, *, t
     for row in rows:
         if target_hit_rate is not None:
             add_latency_deltas(row, lru)
-        control_name = WRITEBACK_CONTROLS.get(row["variant"])
-        if control_name in by_variant:
-            control = by_variant[control_name]
-            assert all(row.get(key) == control.get(key) for key in ("hash_capacity", "lookups", "misses"))
-            row["writeback_control"] = control_name
-            add_latency_deltas(row, control, prefix="writeback_")
+        for prefix, controls in (("writeback", WRITEBACK_CONTROLS), ("pipeline", PIPELINE_CONTROLS)):
+            control_name = controls.get(row["variant"])
+            if control_name in by_variant:
+                control = by_variant[control_name]
+                assert all(row.get(key) == control.get(key) for key in ("hash_capacity", "lookups", "misses"))
+                row[f"{prefix}_control"] = control_name
+                add_latency_deltas(row, control, prefix=f"{prefix}_")
         print(json.dumps(row), flush=True)
     return rows
 
