@@ -11,6 +11,7 @@ import torch
 import torch_npu  # noqa: F401
 
 from benchmarks.benchmark_hisparse_eviction import NativeResolver, Reference, make_trace
+from benchmarks.benchmark_hisparse_eviction_ablation import expand_request_trace
 from vllm_ascend.hisparse.cache_ops import (
     AGE_GROUP_CANDIDATES,
     AGE_REUSE_TAG_SCRATCH,
@@ -1240,3 +1241,28 @@ def test_eviction_lazy_ages_after_resident_graph_replay():
             assert not resolver.errors[:, 0].cpu().any()
             assert resolver.pending_age[0, 0].item() == 0
             assert resolver.ages[0, :3].tolist() == [32767, 0, 4]
+
+
+@pytest.mark.parametrize("num_requests", [2, 4])
+def test_eviction_ablation_verifies_independent_requests(num_requests):
+    queries, topk, hot_size = 4, 2048, 10240
+    trace = list(make_trace("reuse-plus-scan", 6, queries, topk, hot_size))
+    trace[2] = [-1] * (queries * topk)
+    batch, host_size = expand_request_trace(trace, num_requests)
+    resolver = NativeResolver(
+        queries,
+        topk,
+        hot_size,
+        host_size,
+        4,
+        lazy_age=True,
+        age_options=AGE_GROUP_CANDIDATES | AGE_REUSE_TAG_SCRATCH,
+        num_requests=num_requests,
+    )
+    assert resolver.max_union_rows == queries * topk
+    stats = resolver.verify(batch, [resolver.tensor(selection) for selection in batch])
+    reference = Reference(hot_size, 4)
+    for selection in trace:
+        reference.resolve(selection)
+    assert stats.lookups == reference.lookups * num_requests
+    assert stats.misses == reference.misses * num_requests

@@ -316,3 +316,20 @@ The JSON contains one array per Decode round. A round contains either
 `(MTP+1) * Top-K` flattened IDs or one Top-K array per query. Use `-1` for
 padding. Replay treats the IDs as Host candidates. Repeat `--probation-age`
 to sweep thresholds, for example `--probation-age 1 --probation-age 4`.
+
+#### Concurrent requests
+
+Increase `--requests` to time one resolver launch with several requests.
+`--mtp` and `--hot-size` still apply per request. The runner replays the same
+trace in disjoint Host row ranges and allocates separate Hot slots and age
+state for each request. The result includes `requests` and `total_queries`.
+Times are per Decode batch. Combined timing uses a larger mapped Host
+buffer as the request count grows.
+
+```bash
+for requests in 1 2 4 8 16; do
+  python -m benchmarks.benchmark_hisparse_eviction_ablation \
+    --execution graph --mtp 3 --requests "$requests" --scenario reuse-plus-scan \
+    --variant lru --variant age-reuse-ub --output "reuse-scan-${requests}req.json"
+done
+```

@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable
 from statistics import median
+from typing import NamedTuple
 
 SCENARIOS = ("sliding-window", "reuse-plus-scan", "cyclic-overflow", "disjoint")
 
@@ -96,11 +97,30 @@ class Reference:
         return (self.lookups - self.misses) / self.lookups
 
 
+class TraceStats(NamedTuple):
+    lookups: int
+    misses: int
+
+    @property
+    def hit_rate(self):
+        return (self.lookups - self.misses) / self.lookups
+
+
 class NativeResolver:
     """Call only the native resolver. Host payload copies are outside the timed region."""
 
     def __init__(
-        self, queries, topk, hot_size, host_size, probation_age, *, lazy_age=False, age_options=0, hash_limit=0
+        self,
+        queries,
+        topk,
+        hot_size,
+        host_size,
+        probation_age,
+        *,
+        lazy_age=False,
+        age_options=0,
+        hash_limit=0,
+        num_requests=1,
     ):
         import torch
         import torch_npu  # noqa: F401
@@ -116,7 +136,11 @@ class NativeResolver:
         self.torch = torch
         self.op = torch.ops._C_ascend.hisparse_resolve_residency
         self.device = f"npu:{torch.npu.current_device()}"
-        self.shape = (queries, topk)
+        self.num_requests = num_requests
+        self.queries_per_request = queries
+        self.max_union_rows = queries * topk
+        rows = num_requests * queries
+        self.shape = (rows, topk)
         self.host_size = host_size
         self.block = 128
         self.hot_size = hot_size
@@ -124,29 +148,34 @@ class NativeResolver:
         self.age_options = age_options
         self.hash_limit = hash_limit
         self.hash_capacity = torch.ops._C_ascend.hisparse_resolver_validate_scratch(
-            hot_size, queries * topk, probation_age is not None, bool(age_options & AGE_REUSE_TAG_SCRATCH)
+            hot_size, self.max_union_rows, probation_age is not None, bool(age_options & AGE_REUSE_TAG_SCRATCH)
         )
         if hash_limit:
             self.hash_capacity = min(self.hash_capacity, hash_limit)
         self.pending_age = (
-            torch.zeros((1, PENDING_AGE_ROW_WIDTH), dtype=torch.int32, device=self.device) if lazy_age else None
+            torch.zeros((num_requests, PENDING_AGE_ROW_WIDTH), dtype=torch.int32, device=self.device)
+            if lazy_age
+            else None
         )
-        self.requests = torch.zeros(queries, dtype=torch.int32, device=self.device)
-        self.valid_rows = torch.tensor([queries], dtype=torch.int32, device=self.device)
-        self.table = torch.arange(hot_size // self.block, dtype=torch.int32, device=self.device)[None]
-        self.tags = torch.empty((1, hot_size), dtype=torch.int32, device=self.device)
+        self.requests = torch.arange(num_requests, dtype=torch.int32).repeat_interleave(queries).to(self.device)
+        self.valid_rows = torch.tensor([rows], dtype=torch.int32, device=self.device)
+        blocks = hot_size // self.block
+        self.table = torch.arange(num_requests * blocks, dtype=torch.int32, device=self.device).view(
+            num_requests, blocks
+        )
+        self.tags = torch.empty((num_requests, hot_size), dtype=torch.int32, device=self.device)
         self.order = torch.empty_like(self.tags, dtype=torch.int16)
         self.initial_order = torch.arange(hot_size, dtype=torch.int32, device=self.device).to(torch.int16)
         self.ages = torch.empty_like(self.order) if probation_age is not None else None
         self.out, self.resolved, self.host, self.victims = (
             torch.empty(self.shape, dtype=torch.int32, device=self.device) for _ in range(4)
         )
-        self.counts = torch.empty(queries, dtype=torch.int32, device=self.device)
-        self.errors = torch.empty((queries, 8), dtype=torch.int32, device=self.device)
+        self.counts = torch.empty(rows, dtype=torch.int32, device=self.device)
+        self.errors = torch.empty((rows, 8), dtype=torch.int32, device=self.device)
 
     def reset(self):
         self.tags.fill_(-1)
-        self.order.copy_(self.initial_order[None])
+        self.order.copy_(self.initial_order.expand_as(self.order))
         if self.ages is not None:
             self.ages.zero_()
         if self.pending_age is not None:
@@ -182,7 +211,7 @@ class NativeResolver:
             self.block if resident is not None else 0,
             0,
             self.block,
-            self.shape[0] * self.shape[1],
+            self.max_union_rows,
             0,
             self.ages,
             4 if self.probation_age is None else self.probation_age,
@@ -193,23 +222,39 @@ class NativeResolver:
 
     def verify(self, trace, inputs):
         self.reset()
-        ref = Reference(self.hot_size, self.probation_age)
+        refs = [Reference(self.hot_size, self.probation_age) for _ in range(self.num_requests)]
         for step, (selection, logical) in enumerate(zip(trace, inputs)):
-            plan, physical = ref.resolve(selection)
             self.resolve(logical)
             assert not self.errors[:, 0].cpu().any(), f"resolver failed at step {step}"
-            misses = sum(self.counts.tolist())
-            assert misses == len(plan), step
-            host = self.host.flatten().tolist()[:misses]
-            victims = self.victims.flatten().tolist()[:misses]
-            assert list(zip(host, victims)) == plan, step
-            assert self.out.flatten().tolist() == physical, step
-            assert self.tags[0].tolist() == ref.tags, step
-            assert self.order[0].tolist() == ref.order, step
-            if self.ages is not None:
-                actual = self.ages[0].tolist()
-                assert all(actual[i] == ref.ages[i] for i, tag in enumerate(ref.tags) if tag >= 0), step
-        return ref
+            counts = self.counts.tolist()
+            host = self.host.flatten().tolist()
+            victims = self.victims.flatten().tolist()
+            physical = self.out.flatten().tolist()
+            tags, order = self.tags.tolist(), self.order.tolist()
+            ages = self.ages.tolist() if self.ages is not None else None
+            pending = self.pending_age[:, 0].tolist() if self.pending_age is not None else [0] * self.num_requests
+            for request, ref in enumerate(refs):
+                start = request * self.max_union_rows
+                stop = start + self.max_union_rows
+                first_row = request * self.queries_per_request
+                plan, expected = ref.resolve(selection[start:stop])
+                misses = sum(counts[first_row : first_row + self.queries_per_request])
+                offset = request * self.hot_size
+                where = (step, request)
+                assert misses == len(plan), where
+                assert list(zip(host[start : start + misses], victims[start : start + misses])) == [
+                    (token, slot + offset) for token, slot in plan
+                ], where
+                assert physical[start:stop] == [slot + offset if slot >= 0 else -1 for slot in expected], where
+                assert tags[request] == ref.tags, where
+                assert order[request] == ref.order, where
+                if ages is not None:
+                    assert all(
+                        min(32767, ages[request][i] + pending[request]) == ref.ages[i]
+                        for i, tag in enumerate(ref.tags)
+                        if tag >= 0
+                    ), where
+        return TraceStats(sum(ref.lookups for ref in refs), sum(ref.misses for ref in refs))
 
     def time_trace(
         self, inputs, repeats, graph_mode, *, source=None, resident=None, gather: Callable[[], None] | None = None

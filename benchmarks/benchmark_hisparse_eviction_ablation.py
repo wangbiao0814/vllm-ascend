@@ -71,6 +71,20 @@ def load_trace(path, queries, topk):
     return trace
 
 
+def expand_request_trace(trace, num_requests):
+    """Clone the workload per request, using disjoint Host row ranges."""
+    host_rows_per_request = max(1, max(map(max, trace)) + 1)
+    host_size = host_rows_per_request * num_requests
+    if host_size > 2**31 - 1:
+        raise ValueError("batched Host row range exceeds int32")
+    if num_requests == 1:
+        return trace, host_size
+    offsets = range(0, host_size, host_rows_per_request)
+    return [
+        [token + offset if token >= 0 else -1 for offset in offsets for token in selection] for selection in trace
+    ], host_size
+
+
 @contextmanager
 def mapped_gather(resolver, memfabric):
     from vllm_ascend.hisparse.c8 import C8_ROW_BYTES
@@ -84,7 +98,7 @@ def mapped_gather(resolver, memfabric):
         # Touch all pages outside the timed region, including for disjoint traces.
         host.fill_(1)
         hot = torch.empty(
-            (resolver.hot_size // resolver.block, resolver.block, C8_ROW_BYTES),
+            (resolver.num_requests * (resolver.hot_size // resolver.block), resolver.block, C8_ROW_BYTES),
             dtype=torch.int8,
             device=resolver.device,
         )
@@ -101,7 +115,10 @@ def mapped_gather(resolver, memfabric):
 
 def run_scenario(args, name, trace, hot_size, queries, probation, variants):
     resident_only = name == "resident-only"
-    host_size = 256 if resident_only else max(1, max(map(max, trace)) + 1)
+    if resident_only:
+        host_size = (args.requests + 1) * 128
+    else:
+        trace, host_size = expand_request_trace(trace, args.requests)
     # Discover the actual age-constrained hash size on this SoC. No hard-coded
     # UB budget or shape-specific 9408 in the matched variants.
     matched_hash = 0
@@ -122,19 +139,23 @@ def run_scenario(args, name, trace, hot_size, queries, probation, variants):
             lazy_age=variant.lazy,
             age_options=variant.options,
             hash_limit=matched_hash if variant.match_hash else 0,
+            num_requests=args.requests,
         )
         source = resident = None
         if resident_only:
             torch = resolver.torch
-            source = torch.tensor([[1]], dtype=torch.int32, device=resolver.device)
-            resident = torch.tensor([[2]], dtype=torch.int32, device=resolver.device)
-            selection = [i % 128 for i in range(queries * args.topk)]
-            indices = resolver.tensor(selection)
+            pages = torch.arange(1, args.requests + 1, dtype=torch.int32, device=resolver.device)[:, None]
+            source, resident = pages, pages + 1
+            selection = [i % resolver.block for i in range(resolver.max_union_rows)]
+            indices = resolver.tensor(selection * args.requests)
             inputs = [indices] * args.rounds
             resolver.reset()
             resolver.resolve(indices, source, resident)
             assert not resolver.counts.any().item()
-            assert resolver.out.flatten().tolist() == [256 + i for i in selection]
+            expected = [
+                (request + 2) * resolver.block + token for request in range(args.requests) for token in selection
+            ]
+            assert resolver.out.flatten().tolist() == expected
             lookups = misses = 0
         else:
             inputs = [resolver.tensor(selection) for selection in trace]
@@ -146,7 +167,9 @@ def run_scenario(args, name, trace, hot_size, queries, probation, variants):
             "probation_age": probation if variant.with_age else None,
             "variant": variant_name,
             "execution": args.execution,
+            "requests": args.requests,
             "queries": queries,
+            "total_queries": queries * args.requests,
             "topk": args.topk,
             "hot_size": hot_size,
             "rounds": len(inputs),
@@ -178,6 +201,7 @@ def main():
     parser.add_argument("--trace", type=Path, help="JSON Top-K IDs with fixed query count and width per round")
     parser.add_argument("--output", type=Path, help="write the measurement rows as JSON")
     parser.add_argument("--mtp", type=int, default=3)
+    parser.add_argument("--requests", type=int, default=1, help="requests per resolver batch")
     parser.add_argument("--topk", type=int, default=2048)
     parser.add_argument("--hot-size", type=int)
     parser.add_argument("--probation-age", type=int, action="append", help="repeat to sweep multiple values")
@@ -190,6 +214,8 @@ def main():
     ages = args.probation_age or [4]
     if (
         queries <= 0
+        or args.requests <= 0
+        or queries * args.requests > 2**31 - 1
         or args.topk <= 0
         or not queries * args.topk <= hot_size <= 32768
         or hot_size % 128

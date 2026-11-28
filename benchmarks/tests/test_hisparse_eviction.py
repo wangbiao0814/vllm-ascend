@@ -6,7 +6,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from benchmarks.benchmark_hisparse_eviction import Reference, make_trace
-from benchmarks.benchmark_hisparse_eviction_ablation import load_trace
+from benchmarks.benchmark_hisparse_eviction_ablation import expand_request_trace, load_trace
 
 
 class TestHiSparseEvictionReference(unittest.TestCase):
@@ -39,6 +39,18 @@ class TestHiSparseEvictionReference(unittest.TestCase):
 
 
 class TestAblationTrace(unittest.TestCase):
+    def test_batch_uses_disjoint_host_ranges_and_preserves_padding(self):
+        trace = [[1, -1, 2, 3], [0, -1, 2, 2]]
+        expanded, host_size = expand_request_trace(trace, 3)
+        self.assertEqual(host_size, 12)
+        self.assertEqual(
+            expanded, [[1, -1, 2, 3, 5, -1, 6, 7, 9, -1, 10, 11], [0, -1, 2, 2, 4, -1, 6, 6, 8, -1, 10, 10]]
+        )
+
+    def test_batch_rejects_host_rows_that_exceed_int32(self):
+        with self.assertRaisesRegex(ValueError, "exceeds int32"):
+            expand_request_trace([[2**30]], 2)
+
     def test_trace_supports_flat_and_per_query_rounds(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "trace.json"
