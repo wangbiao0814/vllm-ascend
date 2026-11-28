@@ -5,8 +5,8 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from benchmarks.benchmark_hisparse_eviction import Reference, make_trace
-from benchmarks.benchmark_hisparse_eviction_ablation import expand_request_trace, load_trace
+from benchmarks.benchmark_hisparse_eviction import Reference, make_hit_rate_trace, make_trace
+from benchmarks.benchmark_hisparse_eviction_ablation import expand_request_trace, load_trace, reference_stats
 
 
 class TestHiSparseEvictionReference(unittest.TestCase):
@@ -39,6 +39,19 @@ class TestHiSparseEvictionReference(unittest.TestCase):
 
 
 class TestAblationTrace(unittest.TestCase):
+    def test_steady_hit_rate_excludes_priming_and_keeps_union_full(self):
+        requests, queries, topk, rounds, hot_size = 3, 4, 8, 6, 40
+        width = queries * topk
+        for rate in (0, 0.5, 0.9, 1.0):
+            trace = list(make_hit_rate_trace(rounds, queries, topk, rate))
+            self.assertTrue(all(len(set(row)) == width for row in trace))
+            batch, _ = expand_request_trace(trace, requests)
+            for age in (None, 4, 32767):
+                with self.subTest(rate=rate, age=age):
+                    stats = reference_stats(batch, width, hot_size, age, priming_rounds=1)
+                    expected_misses = (width - round(width * rate)) * rounds * requests
+                    self.assertEqual(stats, (width * rounds * requests, expected_misses))
+
     def test_batch_uses_disjoint_host_ranges_and_preserves_padding(self):
         trace = [[1, -1, 2, 3], [0, -1, 2, 2]]
         expanded, host_size = expand_request_trace(trace, 3)

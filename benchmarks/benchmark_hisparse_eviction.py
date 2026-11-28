@@ -28,6 +28,19 @@ def make_trace(scenario, rounds, queries, topk, hot_size):
             yield list(range(start, start + union_size))
 
 
+def make_hit_rate_trace(rounds, queries, topk, hit_rate):
+    """Yield a priming round, then full unions with a fixed number of Hot hits."""
+    width = queries * topk
+    hits = round(width * hit_rate)
+    yield list(range(width))
+    for step in range(rounds):
+        reused = iter(range(hits))
+        fresh = iter(range(width + step * (width - hits), width + (step + 1) * (width - hits)))
+        yield [
+            next(reused) if (pos + 1) * hits // width != pos * hits // width else next(fresh) for pos in range(width)
+        ]
+
+
 class Reference:
     """Track distinct Host-row lookups, hits, and the expected swap plan."""
 
@@ -220,10 +233,13 @@ class NativeResolver:
             self.hash_limit,
         )
 
-    def verify(self, trace, inputs):
+    def verify(self, trace, inputs, *, priming_rounds=0):
         self.reset()
         refs = [Reference(self.hot_size, self.probation_age) for _ in range(self.num_requests)]
+        priming = TraceStats(0, 0)
         for step, (selection, logical) in enumerate(zip(trace, inputs)):
+            if step == priming_rounds:
+                priming = TraceStats(sum(ref.lookups for ref in refs), sum(ref.misses for ref in refs))
             self.resolve(logical)
             assert not self.errors[:, 0].cpu().any(), f"resolver failed at step {step}"
             counts = self.counts.tolist()
@@ -254,15 +270,31 @@ class NativeResolver:
                         for i, tag in enumerate(ref.tags)
                         if tag >= 0
                     ), where
-        return TraceStats(sum(ref.lookups for ref in refs), sum(ref.misses for ref in refs))
+        return TraceStats(
+            sum(ref.lookups for ref in refs) - priming.lookups,
+            sum(ref.misses for ref in refs) - priming.misses,
+        )
 
     def time_trace(
-        self, inputs, repeats, graph_mode, *, source=None, resident=None, gather: Callable[[], None] | None = None
+        self,
+        inputs,
+        repeats,
+        graph_mode,
+        *,
+        source=None,
+        resident=None,
+        gather: Callable[[], None] | None = None,
+        priming_inputs=(),
     ):
         def step(indices):
             self.resolve(indices, source, resident)
             if gather is not None:
                 gather()
+
+        def reset_and_prime():
+            self.reset()
+            for indices in priming_inputs:
+                step(indices)
 
         torch = self.torch
         stream = torch.npu.Stream()
@@ -272,11 +304,11 @@ class NativeResolver:
         try:
             with torch.npu.stream(stream):
                 for _ in range(2):
-                    self.reset()
+                    reset_and_prime()
                     for indices in inputs:
                         step(indices)
                 if graph_mode == "graph":
-                    self.reset()
+                    reset_and_prime()
                     graph = torch.npu.NPUGraph()
                     with torch.npu.graph(graph, stream=stream):
                         for indices in inputs:
@@ -284,7 +316,7 @@ class NativeResolver:
                 start = torch.npu.Event(enable_timing=True)
                 end = torch.npu.Event(enable_timing=True)
                 for _ in range(repeats):
-                    self.reset()
+                    reset_and_prime()
                     start.record()
                     if graph is None:
                         for indices in inputs:

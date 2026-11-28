@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from benchmarks.benchmark_hisparse_eviction import SCENARIOS, NativeResolver, make_trace
+from benchmarks.benchmark_hisparse_eviction import SCENARIOS, NativeResolver, Reference, make_hit_rate_trace, make_trace
 
 
 @dataclass(frozen=True)
@@ -113,16 +113,16 @@ def mapped_gather(resolver, memfabric):
         mapping.close()
 
 
-def run_scenario(args, name, trace, hot_size, queries, probation, variants):
+def run_scenario(args, name, trace, hot_size, queries, probation, variants, *, target_hit_rate=None):
     resident_only = name == "resident-only"
-    if resident_only:
-        host_size = (args.requests + 1) * 128
-    else:
+    priming_rounds = int(target_hit_rate is not None)
+    host_size = (args.requests + 1) * 128
+    if not resident_only:
         trace, host_size = expand_request_trace(trace, args.requests)
-    # Discover the actual age-constrained hash size on this SoC. No hard-coded
-    # UB budget or shape-specific 9408 in the matched variants.
+
+    # Discover the actual age-constrained hash size on this SoC.
     matched_hash = 0
-    if any(VARIANTS[variant].match_hash for variant in variants):
+    if args.device == "npu" and any(VARIANTS[variant].match_hash for variant in variants):
         probe = NativeResolver(queries, args.topk, hot_size, host_size, probation)
         matched_hash = probe.hash_capacity
         del probe
@@ -130,70 +130,108 @@ def run_scenario(args, name, trace, hot_size, queries, probation, variants):
 
     for variant_name in variants:
         variant = VARIANTS[variant_name]
-        resolver = NativeResolver(
-            queries,
-            args.topk,
-            hot_size,
-            host_size,
-            probation if variant.with_age else None,
-            lazy_age=variant.lazy,
-            age_options=variant.options,
-            hash_limit=matched_hash if variant.match_hash else 0,
-            num_requests=args.requests,
-        )
-        source = resident = None
-        if resident_only:
-            torch = resolver.torch
-            pages = torch.arange(1, args.requests + 1, dtype=torch.int32, device=resolver.device)[:, None]
-            source, resident = pages, pages + 1
-            selection = [i % resolver.block for i in range(resolver.max_union_rows)]
-            indices = resolver.tensor(selection * args.requests)
-            inputs = [indices] * args.rounds
-            resolver.reset()
-            resolver.resolve(indices, source, resident)
-            assert not resolver.counts.any().item()
-            expected = [
-                (request + 2) * resolver.block + token for request in range(args.requests) for token in selection
-            ]
-            assert resolver.out.flatten().tolist() == expected
-            lookups = misses = 0
-        else:
-            inputs = [resolver.tensor(selection) for selection in trace]
-            ref = resolver.verify(trace, inputs)
-            lookups, misses = ref.lookups, ref.misses
-
+        age = probation if variant.with_age else None
         row = {
             "scenario": name,
-            "probation_age": probation if variant.with_age else None,
+            "probation_age": age,
             "variant": variant_name,
-            "execution": args.execution,
+            "device": args.device,
+            "execution": args.execution if args.device == "npu" else None,
             "requests": args.requests,
             "queries": queries,
             "total_queries": queries * args.requests,
             "topk": args.topk,
             "hot_size": hot_size,
-            "rounds": len(inputs),
-            "hash_capacity": resolver.hash_capacity,
-            "lookups": lookups,
-            "misses": misses,
-            "hit_rate": (lookups - misses) / lookups if lookups else None,
+            "rounds": args.rounds if resident_only else len(trace) - priming_rounds,
+            "target_hit_rate": target_hit_rate,
         }
-        if args.measure in ("resolver", "both"):
-            row["resolver_us"] = resolver.time_trace(
-                inputs, args.repeats, args.execution, source=source, resident=resident
+        if args.device == "cpu":
+            lookups, misses = reference_stats(trace, queries * args.topk, hot_size, age, priming_rounds)
+        else:
+            resolver = NativeResolver(
+                queries,
+                args.topk,
+                hot_size,
+                host_size,
+                age,
+                lazy_age=variant.lazy,
+                age_options=variant.options,
+                hash_limit=matched_hash if variant.match_hash else 0,
+                num_requests=args.requests,
             )
-        if args.measure in ("combined", "both"):
-            with mapped_gather(resolver, args.memfabric) as gather:
-                row["combined_us"] = resolver.time_trace(
-                    inputs, args.repeats, args.execution, source=source, resident=resident, gather=gather
-                )
+            row["hash_capacity"] = resolver.hash_capacity
+            source = resident = None
+            if resident_only:
+                torch = resolver.torch
+                pages = torch.arange(1, args.requests + 1, dtype=torch.int32, device=resolver.device)[:, None]
+                source, resident = pages, pages + 1
+                selection = [i % resolver.block for i in range(resolver.max_union_rows)]
+                indices = resolver.tensor(selection * args.requests)
+                inputs = [indices] * args.rounds
+                resolver.reset()
+                resolver.resolve(indices, source, resident)
+                assert not resolver.counts.any().item()
+                expected = [
+                    (request + 2) * resolver.block + token for request in range(args.requests) for token in selection
+                ]
+                assert resolver.out.flatten().tolist() == expected
+                lookups = misses = 0
+            else:
+                inputs = [resolver.tensor(selection) for selection in trace]
+                lookups, misses = resolver.verify(trace, inputs, priming_rounds=priming_rounds)
+
+            timed_inputs, priming_inputs = inputs[priming_rounds:], inputs[:priming_rounds]
+            kwargs = dict(source=source, resident=resident, priming_inputs=priming_inputs)
+            if args.measure in ("resolver", "both"):
+                row["resolver_us"] = resolver.time_trace(timed_inputs, args.repeats, args.execution, **kwargs)
+            if args.measure in ("combined", "both"):
+                with mapped_gather(resolver, args.memfabric) as gather:
+                    row["combined_us"] = resolver.time_trace(
+                        timed_inputs, args.repeats, args.execution, gather=gather, **kwargs
+                    )
+        row.update(lookups=lookups, misses=misses, hit_rate=(lookups - misses) / lookups if lookups else None)
+        if target_hit_rate is not None:
+            union = queries * args.topk
+            assert lookups == args.requests * args.rounds * union
+            assert misses == args.requests * args.rounds * (union - round(union * target_hit_rate))
         rows.append(row)
-        print(json.dumps(row), flush=True)
+        if target_hit_rate is None:
+            print(json.dumps(row), flush=True)
+    if target_hit_rate is not None:
+        baseline = next((row for row in rows if row["variant"] == "lru"), {})
+        for row in rows:
+            for metric in ("resolver", "combined"):
+                key = f"{metric}_us"
+                if key in baseline and key in row:
+                    row[f"{metric}_delta_us"] = row[key] - baseline[key]
+                    row[f"{metric}_overhead_pct"] = (row[key] / baseline[key] - 1) * 100
+            print(json.dumps(row), flush=True)
     return rows
+
+
+def reference_stats(trace, union, hot_size, probation_age, priming_rounds):
+    requests = len(trace[0]) // union
+    refs = [Reference(hot_size, probation_age) for _ in range(requests)]
+    lookups = misses = 0
+    for step, selection in enumerate(trace):
+        for request, ref in enumerate(refs):
+            start = request * union
+            previous_lookups = ref.lookups
+            plan, _ = ref.resolve(selection[start : start + union])
+            if step >= priming_rounds:
+                lookups += ref.lookups - previous_lookups
+                misses += len(plan)
+    return lookups, misses
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--device", choices=("npu", "cpu"), default="npu", help="CPU validates hit-rate sweeps without timing"
+    )
+    parser.add_argument(
+        "--hit-rate", type=float, action="append", help="sweep synthetic steady-state Hot hit fractions from 0 to 1"
+    )
     parser.add_argument("--execution", choices=("graph", "eager"), default="graph")
     parser.add_argument("--measure", choices=("resolver", "combined", "both"), default="resolver")
     parser.add_argument("--variant", choices=VARIANTS, action="append")
@@ -224,11 +262,20 @@ def main():
         or any(not 0 <= age <= 32767 for age in ages)
     ):
         parser.error("invalid resolver geometry, repeat count or age; Hot size must align to 128")
-    if args.trace and args.scenario:
-        parser.error("select --trace or --scenario")
-    if args.trace:
+    if sum(bool(option) for option in (args.trace, args.scenario, args.hit_rate)) > 1:
+        parser.error("select --trace, --scenario or --hit-rate")
+    if args.device == "cpu" and (not args.hit_rate or args.measure != "resolver"):
+        parser.error("CPU mode validates --hit-rate without NPU or gather timing")
+    if args.hit_rate:
+        if any(not 0 <= rate <= 1 for rate in args.hit_rate):
+            parser.error("--hit-rate values must be fractions between 0 and 1")
+        scenarios = [
+            ("hit-rate-sweep", list(make_hit_rate_trace(args.rounds, queries, args.topk, rate)), rate)
+            for rate in dict.fromkeys(args.hit_rate)
+        ]
+    elif args.trace:
         try:
-            scenarios = [(str(args.trace), load_trace(args.trace, queries, args.topk))]
+            scenarios = [(str(args.trace), load_trace(args.trace, queries, args.topk), None)]
         except (OSError, ValueError) as error:
             parser.error(str(error))
     else:
@@ -236,15 +283,28 @@ def main():
             (
                 name,
                 None if name == "resident-only" else list(make_trace(name, args.rounds, queries, args.topk, hot_size)),
+                None,
             )
             for name in (args.scenario or (*SCENARIOS, "resident-only"))
         ]
-    variants = tuple(dict.fromkeys(args.variant or VARIANTS))
+    default_variants = ("lru", "age-reuse-ub", "age-vector-age") if args.hit_rate else VARIANTS
+    variants = tuple(dict.fromkeys(args.variant or default_variants))
     results = []
-    for name, trace in scenarios:
+    for name, trace, target_hit_rate in scenarios:
         for i, age in enumerate(ages):
             selected = [variant for variant in variants if i == 0 or VARIANTS[variant].with_age]
-            results.extend(run_scenario(args, name, trace, hot_size, queries, age, selected))
+            results.extend(
+                run_scenario(
+                    args,
+                    name,
+                    trace,
+                    hot_size,
+                    queries,
+                    age,
+                    selected,
+                    target_hit_rate=target_hit_rate,
+                )
+            )
     if args.output:
         args.output.write_text(json.dumps(results, indent=2) + "\n")
 

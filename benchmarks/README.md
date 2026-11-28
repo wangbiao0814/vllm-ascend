@@ -333,3 +333,24 @@ for requests in 1 2 4 8 16; do
     --variant lru --variant age-reuse-ub --output "reuse-scan-${requests}req.json"
 done
 ```
+
+#### Hot hit-rate sweep
+
+Use repeated `--hit-rate` values to measure the resolver at fixed Hot hit
+rates. Each request has `(MTP + 1) × Top-K` distinct candidates per round.
+The first round primes Hot on the same stream outside timing. Measured
+rounds reuse a fixed subset of those rows and introduce fresh Host rows
+for the rest. All variants see the same hits and misses. At 100% the
+resolver still exercises Hot lookups, with no Resident mapping.
+
+```bash
+python -m benchmarks.benchmark_hisparse_eviction_ablation \
+  --execution graph --mtp 3 --requests 1 --measure both \
+  --hit-rate 0.50 --hit-rate 0.75 --hit-rate 0.90 --hit-rate 0.95 \
+  --hit-rate 0.99 --hit-rate 1.0 --output hit-rate-graph.json
+```
+
+The default sweep compares `lru`, `age-reuse-ub`, and `age-vector-age`.
+The output includes the latency delta from LRU for each measured metric.
+Use `--device cpu` without `--measure both` to check the expected hit and
+miss counts on a machine without an NPU.
