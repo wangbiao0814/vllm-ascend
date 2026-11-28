@@ -354,3 +354,23 @@ The default sweep compares `lru`, `age-reuse-ub`, and `age-vector-age`.
 The output includes the latency delta from LRU for each measured metric.
 Use `--device cpu` without `--measure both` to check the expected hit and
 miss counts on a machine without an NPU.
+
+#### Low-hit refill age initialization
+
+`age-dense-refill` uses the same hash capacity and eviction policy as
+`age-reuse-ub`. When a round refills at least half the Hot slots and at
+least twice as many slots as it retains without hits, the kernel uses
+`int16` vector initialization for the refill ages. Valid survivors keep
+their advanced ages and hits reset to zero. Rounds below the threshold
+use the existing scalar path.
+
+```bash
+python -m benchmarks.benchmark_hisparse_eviction_ablation \
+  --execution graph --mtp 3 --requests 1 --measure both \
+  --hit-rate 0.0 --hit-rate 0.1 --hit-rate 0.25 --hit-rate 0.50 \
+  --variant lru --variant age-reuse-ub --variant age-dense-refill \
+  --output low-hit-graph.json
+```
+
+The variant is experimental and is selected through the benchmark.
+Rebuild the custom OPP before using it.

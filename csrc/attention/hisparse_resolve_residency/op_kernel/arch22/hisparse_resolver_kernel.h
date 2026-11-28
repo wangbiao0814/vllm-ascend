@@ -433,10 +433,15 @@ public:
         return steps < INT16_MAX ? steps + 1 : INT16_MAX;
     }
 
-    __aicore__ inline int16_t AdvanceAge(int32_t slot, int32_t steps)
+    __aicore__ inline int16_t ReadAdvancedAge(int32_t slot, int32_t steps)
     {
         int32_t age = ages.GetValue(slot) + steps;
-        int16_t next = int16_t(age < INT16_MAX ? age : INT16_MAX);
+        return int16_t(age < INT16_MAX ? age : INT16_MAX);
+    }
+
+    __aicore__ inline int16_t AdvanceAge(int32_t slot, int32_t steps)
+    {
+        int16_t next = ReadAdvancedAge(slot, steps);
         ages.SetValue(slot, next);
         return next;
     }
@@ -502,6 +507,7 @@ public:
         for (int32_t p = 0; p < hits; ++p) AppendSlot(order.GetValue(p), out);
     }
 
+    template <bool DenseRefill>
     __aicore__ inline void WriteGroupedAgeOrder(int32_t hits, int32_t occupied, int32_t empty,
                                                  int32_t steps, bool vectorAge)
     {
@@ -521,14 +527,20 @@ public:
         bool inserted = false;
         for (int32_t i = usedOccupied; i < occupied; ++i) {
             int32_t slot = slots.GetValue(hot - 1 - i);
-            int16_t age = vectorAge ? ages.GetValue(slot) : AdvanceAge(slot, steps);
+            int16_t age;
+            if constexpr (DenseRefill) {
+                age = freeSlots.GetValue(empty + i);
+                ages.SetValue(slot, age);
+            } else {
+                age = vectorAge ? ages.GetValue(slot) : AdvanceAge(slot, steps);
+            }
             if (!inserted && age < probation) {
-                EmitRefills(queue, bulk, slots, freeSlots, usedFree, usedOccupied, probation, out);
+                EmitRefills<DenseRefill>(queue, bulk, slots, freeSlots, usedFree, usedOccupied, probation, out);
                 inserted = true;
             }
             EmitAgeSlot(queue, bulk, slot, out);
         }
-        if (!inserted) EmitRefills(queue, bulk, slots, freeSlots, usedFree, usedOccupied, probation, out);
+        if (!inserted) EmitRefills<DenseRefill>(queue, bulk, slots, freeSlots, usedFree, usedOccupied, probation, out);
         for (int32_t p = 0; p < hits; ++p) {
             int32_t slot = slots.GetValue(p);
             ages.SetValue(slot, int16_t(0));
@@ -543,27 +555,55 @@ public:
         else AppendSlot(slot, out);
     }
 
+    template <bool DenseRefill>
     __aicore__ inline void EmitRefills(LocalTensor<int16_t> queue, bool bulk, LocalTensor<int16_t> slots,
                                        LocalTensor<int16_t> freeSlots, int32_t usedFree,
                                        int32_t usedOccupied, int16_t probation, int32_t &out)
     {
         for (int32_t i = 0; i < usedFree; ++i) {
             int32_t slot = freeSlots.GetValue(i);
-            ages.SetValue(slot, probation);
+            if constexpr (!DenseRefill) ages.SetValue(slot, probation);
             EmitAgeSlot(queue, bulk, slot, out);
         }
         for (int32_t i = 0; i < usedOccupied; ++i) {
             int32_t slot = slots.GetValue(hot - 1 - i);
-            ages.SetValue(slot, probation);
+            if constexpr (!DenseRefill) ages.SetValue(slot, probation);
             EmitAgeSlot(queue, bulk, slot, out);
         }
     }
 
+    __aicore__ inline void PrepareDenseRefillAges(int32_t occupied, int32_t empty, int32_t steps)
+    {
+        const int32_t usedOccupied = misses > empty ? misses - empty : 0;
+        if (usedOccupied < occupied) {
+            LoadAges();
+            auto slots = order.ReinterpretCast<int16_t>();
+            auto freeSlots = slots[hot];
+            // Preserve advanced ages beyond the live free list. Empty and
+            // occupied candidates are disjoint, so empty + occupied <= hot.
+            for (int32_t i = usedOccupied; i < occupied; ++i) {
+                int32_t slot = slots.GetValue(hot - 1 - i);
+                freeSlots.SetValue(empty + i, ReadAdvancedAge(slot, steps));
+            }
+        }
+        // No previous age is needed when every valid slot is hit or refilled.
+        Sync<HardEvent::S_V>();
+        Duplicate(ages, int16_t(d.geometry[25]), hot);
+        Sync<HardEvent::V_S>();
+    }
+
     __aicore__ inline void CommitAgeOrder(int32_t hits, int32_t evictable, int32_t empty, uint32_t options)
     {
-        LoadAges();
         const int32_t steps = AgeSteps();
         const bool vectorAge = options & kVectorAge;
+        const int32_t usedOccupied = misses > empty ? misses - empty : 0;
+        const int32_t survivors = evictable - usedOccupied;
+        // Bulk initialization pays off only when refills dominate the extra
+        // pass over survivors. Keep the scalar path for sparse refills.
+        const bool denseRefill = (options & kDenseRefillAge) && hot % 16 == 0 &&
+                                 misses >= hot / 2 && misses >= 2 * survivors;
+        if (denseRefill) PrepareDenseRefillAges(evictable, empty, steps);
+        else LoadAges();
         if (vectorAge) {
             // Invalid tags make their ages immaterial. Refill and hit ages are
             // overwritten below. Limit before the int16 add to prevent wrap.
@@ -573,8 +613,10 @@ public:
             Adds(ages, ages, int16_t(steps), hot);
             Sync<HardEvent::V_S>();
         }
-        if (options & kGroupCandidates) {
-            WriteGroupedAgeOrder(hits, evictable, empty, steps, vectorAge);
+        if (denseRefill) {
+            WriteGroupedAgeOrder<true>(hits, evictable, empty, steps, false);
+        } else if (options & kGroupCandidates) {
+            WriteGroupedAgeOrder<false>(hits, evictable, empty, steps, vectorAge);
         } else {
             for (int32_t p = 0; p < evictable; ++p) {
                 int32_t entry = order.GetValue(hot - 1 - p);

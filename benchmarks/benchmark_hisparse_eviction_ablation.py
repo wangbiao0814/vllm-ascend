@@ -22,10 +22,12 @@ class Variant:
     match_hash: bool = False
     vector_age: bool = False
     gather_mask: bool = False
+    dense_refill: bool = False
 
     @property
     def options(self):
         from vllm_ascend.hisparse.cache_ops import (
+            AGE_DENSE_REFILL,
             AGE_GROUP_CANDIDATES,
             AGE_REUSE_TAG_SCRATCH,
             AGE_VECTOR_GROUPING,
@@ -37,6 +39,7 @@ class Variant:
             | (AGE_REUSE_TAG_SCRATCH if self.reuse_ub else 0)
             | (AGE_VECTOR_INCREMENT if self.vector_age else 0)
             | (AGE_VECTOR_GROUPING if self.gather_mask else 0)
+            | (AGE_DENSE_REFILL if self.dense_refill else 0)
         )
 
 
@@ -49,6 +52,7 @@ VARIANTS = {
     "age-reuse-ub-matched": Variant(grouped=True, reuse_ub=True, match_hash=True),
     "age-reuse-ub": Variant(grouped=True, reuse_ub=True),
     "age-vector-age": Variant(grouped=True, reuse_ub=True, vector_age=True),
+    "age-dense-refill": Variant(grouped=True, reuse_ub=True, dense_refill=True),
     "age-gather-mask": Variant(grouped=True, reuse_ub=True, gather_mask=True),
     "age-vector-both": Variant(grouped=True, reuse_ub=True, vector_age=True, gather_mask=True),
 }

@@ -10,9 +10,10 @@ import pytest
 import torch
 import torch_npu  # noqa: F401
 
-from benchmarks.benchmark_hisparse_eviction import NativeResolver, Reference, make_trace
+from benchmarks.benchmark_hisparse_eviction import NativeResolver, Reference, make_hit_rate_trace, make_trace
 from benchmarks.benchmark_hisparse_eviction_ablation import expand_request_trace
 from vllm_ascend.hisparse.cache_ops import (
+    AGE_DENSE_REFILL,
     AGE_GROUP_CANDIDATES,
     AGE_REUSE_TAG_SCRATCH,
     AGE_VECTOR_GROUPING,
@@ -1266,3 +1267,21 @@ def test_eviction_ablation_verifies_independent_requests(num_requests):
         reference.resolve(selection)
     assert stats.lookups == reference.lookups * num_requests
     assert stats.misses == reference.misses * num_requests
+
+
+@pytest.mark.parametrize("rate", [0.0, 0.1, 0.25, 0.95])
+@pytest.mark.parametrize("probation", [0, 4, 32767])
+def test_dense_refill_age_matches_reference(rate, probation):
+    queries, topk, hot_size = 4, 2048, 10240
+    trace = list(make_hit_rate_trace(4, queries, topk, rate))
+    trace.insert(2, [-1] * (queries * topk))
+    resolver = NativeResolver(
+        queries,
+        topk,
+        hot_size,
+        max(map(max, trace)) + 1,
+        probation,
+        lazy_age=True,
+        age_options=AGE_GROUP_CANDIDATES | AGE_REUSE_TAG_SCRATCH | AGE_DENSE_REFILL,
+    )
+    resolver.verify(trace, [resolver.tensor(selection) for selection in trace])

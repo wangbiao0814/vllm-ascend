@@ -132,7 +132,8 @@ ge::graphStatus TileResolve(gert::TilingContext* context,
                     (!withAge && (*ageOptions || withPending)) ||
                     ((*ageOptions & kReuseTagScratch) && !withPending) ||
                     ((*ageOptions & kVectorAge) && hot % 16 != 0) ||
-                    ((*ageOptions & kVectorGrouping) && !(*ageOptions & kGroupCandidates)),
+                    ((*ageOptions & (kVectorGrouping | kDenseRefillAge)) && !(*ageOptions & kGroupCandidates)) ||
+                    ((*ageOptions & kDenseRefillAge) && (*ageOptions & kVectorAge)),
                 OP_LOGE(context->GetNodeName(), "invalid HiSparse age options."),
                 return ge::GRAPH_FAILED);
     OP_CHECK_IF(withPending && (pending->GetOriginShape().GetDimNum() != 2 ||

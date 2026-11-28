@@ -8,7 +8,9 @@ inline constexpr uint32_t kGroupCandidates = 1;
 inline constexpr uint32_t kReuseTagScratch = 2;
 inline constexpr uint32_t kVectorAge = 4;
 inline constexpr uint32_t kVectorGrouping = 8;
-inline constexpr uint32_t kAgeOptions = kGroupCandidates | kReuseTagScratch | kVectorAge | kVectorGrouping;
+inline constexpr uint32_t kDenseRefillAge = 16;
+inline constexpr uint32_t kAgeOptions =
+    kGroupCandidates | kReuseTagScratch | kVectorAge | kVectorGrouping | kDenseRefillAge;
 // Pad request rows to one DMA block so concurrent leaders cannot share it.
 inline constexpr uint32_t kPendingAgeStride = 8;
 }  // namespace vllm_ascend::hisparse
