@@ -661,6 +661,8 @@ endif ()
 # ------------------------------------------------ opbuild ------------------------------------------------
 if (BUILD_OPEN_PROJECT)
     string(REPLACE ";" "\;" OPS_PRODUCT_NAME "${ASCEND_COMPUTE_UNIT}")
+    # Passing TARGET_FILE only orders the build. A file-level dependency
+    # regenerates signatures and ops-info when the registered ABI changes.
     if (generate_aclnn_srcs)
         add_custom_command(OUTPUT ${generate_aclnn_srcs} ${generate_aclnn_headers}
                 COMMAND mkdir -p ${base_aclnn_binary_dir}
@@ -671,6 +673,7 @@ if (BUILD_OPEN_PROJECT)
                 ${OP_BUILD_TOOL}
                 $<TARGET_FILE:op_host_aclnn>
                 ${base_aclnn_binary_dir}
+                DEPENDS op_host_aclnn
         )
     endif ()
 
@@ -688,6 +691,7 @@ if (BUILD_OPEN_PROJECT)
                 ${OP_BUILD_TOOL}
                 $<TARGET_FILE:op_host_aclnnInner>
                 ${base_aclnn_binary_dir}/inner
+                DEPENDS op_host_aclnnInner
         )
     endif ()
 
@@ -705,6 +709,7 @@ if (BUILD_OPEN_PROJECT)
                 ${OP_BUILD_TOOL}
                 $<TARGET_FILE:op_host_aclnnExc>
                 ${base_aclnn_binary_dir}/exc
+                DEPENDS op_host_aclnnExc
         )
     endif ()
 

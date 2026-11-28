@@ -266,6 +266,7 @@ function(add_ops_info_target)
             ${OPS_INFO_JSON}
             COMMAND mkdir -p ${CUSTOM_OPS_INFO_DIR}
             COMMAND cp -f ${OPS_INFO_JSON} ${CUSTOM_OPS_INFO_DIR}
+            DEPENDS op_host_aclnn op_host_aclnnInner op_host_aclnnExc
     )
 
     add_custom_target(${OPS_INFO_TARGET} ALL
