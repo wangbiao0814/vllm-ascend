@@ -83,6 +83,7 @@ extern "C" __global__ __aicore__ void hisparse_resolve_residency(
     descriptor.geometry[23] = tilingData.attentionCapacity;
     descriptor.geometry[24] = tilingData.byteMissMask;
     descriptor.geometry[25] = tilingData.probationAge;
+    descriptor.geometry[26] = tilingData.ageUbBytes;
     AscendC::TPipe pipe;
     Resolver resolver(descriptor, pipe);
     resolver.Process();

@@ -11,12 +11,11 @@
 #pragma once
 
 #include "kernel_operator.h"
-#include "../resolver_scratch.h"
 #include <cstdint>
 
 struct HiSparseArch22Descriptor {
     uint64_t pointers[20];
-    uint64_t geometry[26];
+    uint64_t geometry[27];
 };
 
 namespace {
@@ -78,8 +77,8 @@ public:
         order = orderBuffer.Get<int32_t>();
         io = ioBuffer.Get<int32_t>();
         if (d.pointers[19]) {
-            const auto bytes = vllm_ascend::hisparse::resolver_arch22_age_bytes(hot, true);
-            pipe.InitBuffer(agesBuffer, static_cast<uint32_t>(bytes));
+            // The host tiler passes the same aligned size it reserved in UB.
+            pipe.InitBuffer(agesBuffer, static_cast<uint32_t>(d.geometry[26]));
             ages = agesBuffer.Get<int16_t>();
         }
     }
@@ -424,7 +423,7 @@ public:
     __aicore__ inline void AdvanceAge(int32_t slot)
     {
         int16_t age = ages.GetValue(slot);
-        if (age < vllm_ascend::hisparse::kMaxProbationAge) {
+        if (age < INT16_MAX) {
             ages.SetValue(slot, int16_t(age + 1));
         }
     }

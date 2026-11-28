@@ -227,6 +227,7 @@ ge::graphStatus TileResolve(gert::TilingContext* context,
     tiling.set_hashSize(hashSize);
     tiling.set_ubBytes(ubBytes);
     tiling.set_probationAge(*probationAge);
+    tiling.set_ageUbBytes(static_cast<uint32_t>(resolver_arch22_age_bytes(hot, withAge)));
 
     tiling.set_hostRows(*hostRows);
     tiling.set_hotBlockSize(*hotBlockSize);
