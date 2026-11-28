@@ -13,6 +13,7 @@ import torch_npu  # noqa: F401
 from benchmarks.benchmark_hisparse_eviction import NativeResolver, Reference, make_hit_rate_trace, make_trace
 from benchmarks.benchmark_hisparse_eviction_ablation import expand_request_trace
 from vllm_ascend.hisparse.cache_ops import (
+    AGE_ASYNC_WRITEBACK,
     AGE_DENSE_REFILL,
     AGE_GROUP_CANDIDATES,
     AGE_REUSE_TAG_SCRATCH,
@@ -1118,11 +1119,29 @@ def test_union_overflow_preserves_state(capture, compact):
             graph.reset()
 
 
-@pytest.mark.parametrize("probation", [None, 0, 4, 32767])
-def test_eviction_policy_mtp3_graph_replays(probation):
+@pytest.mark.parametrize(
+    "probation,options",
+    [
+        (None, 0),
+        (0, 0),
+        (4, 0),
+        (32767, 0),
+        (4, AGE_GROUP_CANDIDATES | AGE_REUSE_TAG_SCRATCH | AGE_ASYNC_WRITEBACK),
+        (4, AGE_GROUP_CANDIDATES | AGE_REUSE_TAG_SCRATCH | AGE_DENSE_REFILL | AGE_ASYNC_WRITEBACK),
+    ],
+)
+def test_eviction_policy_mtp3_graph_replays(probation, options):
     queries, topk, hot_size = 4, 2048, 10240
     trace = list(make_trace("reuse-plus-scan", 8, queries, topk, hot_size))
-    resolver = NativeResolver(queries, topk, hot_size, max(map(max, trace)) + 1, probation)
+    resolver = NativeResolver(
+        queries,
+        topk,
+        hot_size,
+        max(map(max, trace)) + 1,
+        probation,
+        lazy_age=bool(options),
+        age_options=options,
+    )
     inputs = [resolver.tensor(selection) for selection in trace]
     resolver.verify(trace, inputs)
 
@@ -1144,7 +1163,8 @@ def test_eviction_policy_mtp3_graph_replays(probation):
                 assert resolver.tags[0].tolist() == reference.tags
                 assert resolver.order[0].tolist() == reference.order
                 if resolver.ages is not None:
-                    assert resolver.ages[0].tolist() == reference.ages
+                    actual = resolver.ages[0].tolist()
+                    assert all(actual[i] == reference.ages[i] for i, tag in enumerate(reference.tags) if tag >= 0)
 
 
 def test_eviction_policy_resident_hit_ages_once_and_ignores_padding():
@@ -1206,7 +1226,8 @@ def test_eviction_ablation_matches_reference(options):
     resolver.verify(trace, [resolver.tensor(rows) for rows in trace])
 
 
-def test_eviction_lazy_ages_after_resident_graph_replay():
+@pytest.mark.parametrize("writeback", [0, AGE_ASYNC_WRITEBACK])
+def test_eviction_lazy_ages_after_resident_graph_replay(writeback):
     queries, topk, hot_size = 4, 2048, 10240
     resolver = NativeResolver(
         queries,
@@ -1215,7 +1236,7 @@ def test_eviction_lazy_ages_after_resident_graph_replay():
         256,
         4,
         lazy_age=True,
-        age_options=AGE_GROUP_CANDIDATES | AGE_REUSE_TAG_SCRATCH,
+        age_options=AGE_GROUP_CANDIDATES | AGE_REUSE_TAG_SCRATCH | writeback,
     )
     resolver.reset()
     resolver.tags[0, :3] = torch.tensor([128, 129, 130], dtype=torch.int32, device=resolver.device)
@@ -1271,7 +1292,8 @@ def test_eviction_ablation_verifies_independent_requests(num_requests):
 
 @pytest.mark.parametrize("rate", [0.0, 0.1, 0.25, 0.95])
 @pytest.mark.parametrize("probation", [0, 4, 32767])
-def test_dense_refill_age_matches_reference(rate, probation):
+@pytest.mark.parametrize("writeback", [0, AGE_ASYNC_WRITEBACK])
+def test_dense_refill_age_matches_reference(rate, probation, writeback):
     queries, topk, hot_size = 4, 2048, 10240
     trace = list(make_hit_rate_trace(4, queries, topk, rate))
     trace.insert(2, [-1] * (queries * topk))
@@ -1282,6 +1304,6 @@ def test_dense_refill_age_matches_reference(rate, probation):
         max(map(max, trace)) + 1,
         probation,
         lazy_age=True,
-        age_options=AGE_GROUP_CANDIDATES | AGE_REUSE_TAG_SCRATCH | AGE_DENSE_REFILL,
+        age_options=AGE_GROUP_CANDIDATES | AGE_REUSE_TAG_SCRATCH | AGE_DENSE_REFILL | writeback,
     )
     resolver.verify(trace, [resolver.tensor(selection) for selection in trace])

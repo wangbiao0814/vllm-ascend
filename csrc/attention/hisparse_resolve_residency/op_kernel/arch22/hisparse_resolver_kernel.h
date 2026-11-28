@@ -48,7 +48,7 @@ __aicore__ inline void Sync()
     WaitFlag<event>(id);
 }
 
-template <typename T>
+template <typename T, bool WaitForCompletion = true>
 __aicore__ inline void Store(uint64_t address, int64_t offset, LocalTensor<T> data, uint32_t count)
 {
     if (!address || !count) return;
@@ -56,8 +56,10 @@ __aicore__ inline void Store(uint64_t address, int64_t offset, LocalTensor<T> da
     destination.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(address));
     Sync<HardEvent::S_MTE3>();
     DataCopyPad(destination[offset], data, DataCopyExtParams{1, count * uint32_t(sizeof(T)), 0, 0, 0});
-    // Scratch is reused immediately, including for sub-32-byte count writes.
-    Sync<HardEvent::MTE3_S>();
+    if constexpr (WaitForCompletion) {
+        // Scratch is reused immediately, including for sub-32-byte count writes.
+        Sync<HardEvent::MTE3_S>();
+    }
 }
 
 class Resolver {
@@ -626,9 +628,16 @@ public:
             for (int32_t p = 0; p < hits; ++p) ages.SetValue(order.GetValue(p), int16_t(0));
             WriteAgeOrder(hits, evictable);
         }
-        Store(d.pointers[19], int64_t(state) * hot, ages, hot);
+        const int64_t ageOffset = int64_t(state) * hot;
+        const bool asyncWriteback = options & kAsyncAgeWriteback;
+        if (!asyncWriteback) Store(d.pointers[19], ageOffset, ages, hot);
         if (d.pointers[20] && steps > 1) {
             Scalar(d.pointers[20], int64_t(state) * kPendingAgeStride, 0);
+        }
+        if (asyncWriteback) {
+            // Publish computes its first index tile in io without reusing ages.
+            // Its first synchronous MTE3 store also drains this earlier write.
+            Store<int16_t, false>(d.pointers[19], ageOffset, ages, hot);
         }
     }
 

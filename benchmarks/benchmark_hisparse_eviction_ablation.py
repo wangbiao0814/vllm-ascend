@@ -23,10 +23,12 @@ class Variant:
     vector_age: bool = False
     gather_mask: bool = False
     dense_refill: bool = False
+    async_writeback: bool = False
 
     @property
     def options(self):
         from vllm_ascend.hisparse.cache_ops import (
+            AGE_ASYNC_WRITEBACK,
             AGE_DENSE_REFILL,
             AGE_GROUP_CANDIDATES,
             AGE_REUSE_TAG_SCRATCH,
@@ -40,6 +42,7 @@ class Variant:
             | (AGE_VECTOR_INCREMENT if self.vector_age else 0)
             | (AGE_VECTOR_GROUPING if self.gather_mask else 0)
             | (AGE_DENSE_REFILL if self.dense_refill else 0)
+            | (AGE_ASYNC_WRITEBACK if self.async_writeback else 0)
         )
 
 
@@ -53,9 +56,25 @@ VARIANTS = {
     "age-reuse-ub": Variant(grouped=True, reuse_ub=True),
     "age-vector-age": Variant(grouped=True, reuse_ub=True, vector_age=True),
     "age-dense-refill": Variant(grouped=True, reuse_ub=True, dense_refill=True),
+    "age-async-write": Variant(grouped=True, reuse_ub=True, async_writeback=True),
+    "age-dense-refill-async": Variant(grouped=True, reuse_ub=True, dense_refill=True, async_writeback=True),
     "age-gather-mask": Variant(grouped=True, reuse_ub=True, gather_mask=True),
     "age-vector-both": Variant(grouped=True, reuse_ub=True, vector_age=True, gather_mask=True),
 }
+
+
+WRITEBACK_CONTROLS = {
+    "age-async-write": "age-reuse-ub",
+    "age-dense-refill-async": "age-dense-refill",
+}
+
+
+def add_latency_deltas(row, baseline, *, prefix=""):
+    for metric in ("resolver", "combined"):
+        key = f"{metric}_us"
+        if key in baseline and key in row:
+            row[f"{prefix}{metric}_delta_us"] = row[key] - baseline[key]
+            row[f"{prefix}{metric}_overhead_pct"] = (row[key] / baseline[key] - 1) * 100
 
 
 def load_trace(path, queries, topk):
@@ -199,17 +218,18 @@ def run_scenario(args, name, trace, hot_size, queries, probation, variants, *, t
             assert lookups == args.requests * args.rounds * union
             assert misses == args.requests * args.rounds * (union - round(union * target_hit_rate))
         rows.append(row)
-        if target_hit_rate is None:
-            print(json.dumps(row), flush=True)
-    if target_hit_rate is not None:
-        baseline = next((row for row in rows if row["variant"] == "lru"), {})
-        for row in rows:
-            for metric in ("resolver", "combined"):
-                key = f"{metric}_us"
-                if key in baseline and key in row:
-                    row[f"{metric}_delta_us"] = row[key] - baseline[key]
-                    row[f"{metric}_overhead_pct"] = (row[key] / baseline[key] - 1) * 100
-            print(json.dumps(row), flush=True)
+    by_variant = {row["variant"]: row for row in rows}
+    lru = by_variant.get("lru", {})
+    for row in rows:
+        if target_hit_rate is not None:
+            add_latency_deltas(row, lru)
+        control_name = WRITEBACK_CONTROLS.get(row["variant"])
+        if control_name in by_variant:
+            control = by_variant[control_name]
+            assert all(row.get(key) == control.get(key) for key in ("hash_capacity", "lookups", "misses"))
+            row["writeback_control"] = control_name
+            add_latency_deltas(row, control, prefix="writeback_")
+        print(json.dumps(row), flush=True)
     return rows
 
 

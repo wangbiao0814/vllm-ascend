@@ -374,3 +374,25 @@ python -m benchmarks.benchmark_hisparse_eviction_ablation \
 
 The variant is experimental and is selected through the benchmark.
 Rebuild the custom OPP before using it.
+
+#### Asynchronous age writeback
+
+Run the matching pairs to isolate whether age DMA overlaps the scalar
+index-generation work in the resolver. Each pair keeps the same eviction
+policy, hit and miss counts, hash capacity, and UB layout. Rebuild the
+custom OPP first.
+
+```bash
+python -m benchmarks.benchmark_hisparse_eviction_ablation \
+  --execution graph --mtp 3 --requests 1 --measure both \
+  --hit-rate 0.0 --hit-rate 0.1 --hit-rate 0.25 --hit-rate 0.5 \
+  --variant age-reuse-ub --variant age-async-write \
+  --variant age-dense-refill --variant age-dense-refill-async \
+  --output age-writeback-graph.json
+```
+
+`writeback_resolver_delta_us` and `writeback_combined_delta_us` measure
+the asynchronous variant against the synchronous `writeback_control`.
+Negative values indicate a reduction in time. The measured difference
+includes the synchronization change. The number of age bytes transferred
+stays the same within each pair.

@@ -6,7 +6,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from benchmarks.benchmark_hisparse_eviction import Reference, make_hit_rate_trace, make_trace
-from benchmarks.benchmark_hisparse_eviction_ablation import expand_request_trace, load_trace, reference_stats
+from benchmarks.benchmark_hisparse_eviction_ablation import (
+    add_latency_deltas,
+    expand_request_trace,
+    load_trace,
+    reference_stats,
+)
 
 
 class TestHiSparseEvictionReference(unittest.TestCase):
@@ -39,6 +44,14 @@ class TestHiSparseEvictionReference(unittest.TestCase):
 
 
 class TestAblationTrace(unittest.TestCase):
+    def test_writeback_delta_uses_the_matching_control(self):
+        row = {"resolver_us": 98.0, "combined_us": 145.0}
+        control = {"resolver_us": 100.0, "combined_us": 150.0}
+        add_latency_deltas(row, control, prefix="writeback_")
+        self.assertEqual(row["writeback_resolver_delta_us"], -2.0)
+        self.assertEqual(row["writeback_combined_delta_us"], -5.0)
+        self.assertAlmostEqual(row["writeback_resolver_overhead_pct"], -2.0)
+
     def test_steady_hit_rate_excludes_priming_and_keeps_union_full(self):
         requests, queries, topk, rounds, hot_size = 3, 4, 8, 6, 40
         width = queries * topk
